@@ -1,46 +1,99 @@
-# Architecture
+# Архитектура
 
-## Layering
+## Общая схема
 
-Public layer:
+Sonotide построен как несколько последовательных слоёв. Верхний слой знает только публичные типы, нижний слой говорит с WASAPI и COM, а между ними стоит тонкий слой оркестрации, который управляет жизненным циклом потоков и преобразует ошибки в типизированный вид.
 
-- `runtime`
-- stream facade types
-- device/format/error/status models
+```text
+Приложение
+  -> публичный API Sonotide
+  -> слой оркестрации
+  -> Windows backend
+  -> COM / WASAPI / Media Foundation
+```
 
-Internal orchestration layer:
+## Слои
 
-- `detail::runtime_backend`
-- stream worker-thread engine
-- lifecycle state machine
+### Публичный слой
 
-Low-level Windows layer:
+Сюда входят `runtime`, stream facade-типы, модели устройств, форматов, ошибок и status snapshot-ы. Этот слой не содержит платформенных зависимостей в сигнатурах и не требует от вызывающего кода знания о COM.
 
-- COM bootstrap
-- endpoint discovery and selection
-- `IAudioClient` activation
-- format negotiation
-- event-driven render/capture packet flow
+### Слой оркестрации
 
-## Ownership
+Внутренний слой управляет рабочим потоком, переходами состояния, `open/start/stop/reset/close` и передачей callback. Здесь же живут адаптеры между публичными типами и внутренними handle-реализациями.
 
-- `runtime` owns a shared backend boundary
-- each stream object owns one `stream_handle`
-- each running stream owns one worker thread and one stop event
-- worker thread owns its COM apartment-scoped WASAPI interfaces
+### Windows backend
 
-## Threading Contract
+Нижний слой содержит:
 
-- `open_*_stream()` is synchronous and lightweight
-- `start()` synchronously waits for worker initialization result
-- callbacks run on the worker thread
-- `stop()` joins the worker thread before returning
-- `close()` is terminal and idempotent
+- bootstrap COM apartment;
+- поиск и выбор endpoint;
+- activation через `IAudioClient`;
+- negotiation формата;
+- событийный путь вывода и захвата;
+- путь декодирования `playback_session` и встроенный EQ;
+- перевод `HRESULT` в структурированные ошибки.
 
-## What Stays Outside Sonotide
+## Владение ресурсами
 
-- decoding from network or file formats
-- DSP chains and app-specific equalizers
-- UI/device preference persistence
-- SoundCloud-specific transport and state coordination
+- `runtime` владеет общей границей backend-слоя.
+- Каждый фасад потока владеет своим `stream_handle`.
+- Активный поток владеет рабочим потоком, событиями и WASAPI-интерфейсами своего apartment-а.
+- Callback объект создаётся снаружи и должен жить дольше, чем сам stream.
 
+Такой подход позволяет держать ownership очевидным: если поток открыт, его ресурсы видны в одном месте, а не размазаны по скрытым глобальным объектам.
+
+## Потоки и жизненный цикл
+
+Базовый контракт простой:
+
+- `open_*_stream()` готовит поток, но не начинает реальную работу;
+- `start()` синхронно ждёт, пока рабочий поток либо поднимется, либо вернёт ошибку;
+- callback выполняется на рабочем потоке;
+- `stop()` дожидается завершения рабочего потока;
+- `reset()` сбрасывает согласованное состояние после остановки;
+- `close()` завершает объект окончательно и безопасен при повторном вызове.
+
+Из этого следует важное правило: код callback не должен быть тяжёлым. Sonotide не прячет работу в скрытых очередях, поэтому на стороне приложения лучше держать callback коротким и предсказуемым.
+
+## Поток данных
+
+### Путь вывода
+
+Приложение получает `audio_buffer_view` и заполняет его данными в формате, который уже согласован с устройством. Для потока вывода Sonotide отвечает за доставку буфера, тайминг и взаимодействие с `IAudioRenderClient`.
+
+### Путь захвата
+
+Для потока захвата callback получает `const_audio_buffer_view`. Поток уже снял данные с устройства, поэтому приложение только читает и обрабатывает готовый пакет.
+
+### Путь loopback
+
+Loopback использует render endpoint как источник, но экспонируется через capture callback. Это удобно для записи системного звука без отдельного микрофонного пути.
+
+### Playback session
+
+`playback_session` объединяет декодирование, транспортное состояние, поток вывода и встроенный EQ. Это не отдельный монолитный backend, а надстройка над уже существующей моделью потоков Sonotide.
+
+## Формат и negotiation
+
+`format_request` описывает предпочтения, а `audio_format` хранит итоговый согласованный результат. Внутренняя логика сначала пытается соблюсти запрошенный формат, а затем, если это разрешено, переходит к варианту, который поддерживает устройство.
+
+Важно, что согласованный формат не прячется внутри backend. Он попадает в `stream_status` и может быть показан пользователю или использован в телеметрии.
+
+## Ошибки и recovery
+
+Sonotide не возвращает голые `HRESULT` наружу. Ошибка всегда оформляется через `error`, где есть категория, код, человекочитаемое сообщение и, если возможно, нативный код.
+
+Флаг `device_lost` и поля статистики в `stream_status` дают приложению понятный сигнал о том, что устройство исчезло, поток оборвался или endpoint стал недоступен. Логика восстановления остаётся видимой и контролируемой, а не скрытой в фоновом коде.
+
+## Что остаётся вне Sonotide
+
+Фреймворк не берёт на себя:
+
+- загрузку и хранение пользовательской медиатеки;
+- сетевую доставку контента;
+- интерфейс и навигацию;
+- сохранение пользовательских настроек;
+- продуктовую транспортную логику поверх `playback_session`.
+
+Это не ограничение, а граница ответственности. Sonotide должен оставаться нижним слоем, который можно переносить между приложениями без переписывания всей остальной системы.

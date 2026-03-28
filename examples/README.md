@@ -1,16 +1,64 @@
-# Examples
+# Примеры
 
-`list_devices.cpp`
+Примеры лежат здесь не для галочки: каждый из них показывает отдельный слой
+Sonotide и помогает быстро проверить, что фреймворк собран и работает в нужном
+окружении.
 
-- shows device enumeration and default-flag metadata
-- useful as a quick smoke test for endpoint discovery
+## `sonotide_list_devices.exe`
 
-`render_silence.cpp`
+Этот пример перечисляет доступные аудиоустройства и печатает устройства по
+умолчанию. Он полезен, когда нужно убедиться, что `runtime` видит системный аудиостек и
+корректно читает метаданные устройств.
 
-- demonstrates runtime creation, render stream opening, and the render callback contract
-- useful for validating the shared-mode event-driven render path
+Запуск:
 
-`playback_session.cpp`
+```bat
+build\msvc-x64-debug\examples\Debug\sonotide_list_devices.exe
+```
 
-- demonstrates the high-level playback session API on top of the render engine
-- useful for validating Media Foundation source loading, transport, timeline updates, and playback-session level DSP hooks
+## `sonotide_render_silence.exe`
+
+Этот пример открывает поток вывода и отправляет в него тишину. Визуально он
+может ничего не показать, поэтому его лучше воспринимать как быструю проверку
+ветки вывода.
+
+Запуск:
+
+```bat
+build\msvc-x64-debug\examples\Debug\sonotide_render_silence.exe
+```
+
+Если нужен явный результат, проверь код возврата:
+
+```bat
+build\msvc-x64-debug\examples\Debug\sonotide_render_silence.exe
+echo %ERRORLEVEL%
+```
+
+## `sonotide_playback_session.exe`
+
+Это уже пример высокого уровня. Он поднимает сессию воспроизведения, загружает
+источник через Media Foundation, строит транспорт и ведёт состояние
+воспроизведения.
+
+Запуск:
+
+```bat
+build\msvc-x64-debug\examples\Debug\sonotide_playback_session.exe "C:\Windows\Media\notify.wav"
+```
+
+Для WSL или bash можно вызвать тот же бинарь через `cmd.exe /c`:
+
+```bash
+cmd.exe /c build\\msvc-x64-debug\\examples\\Debug\\sonotide_list_devices.exe
+cmd.exe /c build\\msvc-x64-debug\\examples\\Debug\\sonotide_render_silence.exe
+cmd.exe /c "build\\msvc-x64-debug\\examples\\Debug\\sonotide_playback_session.exe C:\\Windows\\Media\\notify.wav"
+```
+
+## Как использовать примеры
+
+- `list_devices` удобно запускать первым, чтобы посмотреть, видит ли система
+  нужные endpoints;
+- `render_silence` подходит для проверки базового пути вывода через WASAPI;
+- `playback_session` показывает уже тот сценарий, ради которого фреймворк и
+  задумывался.

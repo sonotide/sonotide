@@ -1,34 +1,43 @@
 # Sonotide
 
-Sonotide is a standalone Windows-only C++20 library that wraps WASAPI behind a production-oriented API for device discovery, render streaming, microphone capture, and loopback capture.
+Sonotide - это независимый C++20-фреймворк для работы со звуком на Windows.
+Он закрывает низкоуровневую часть вокруг WASAPI, а сверху даёт понятный API
+для перечисления устройств, открытия потоков вывода, захвата и loopback, а
+также для сборки сессий воспроизведения с Media Foundation и встроенным
+эквалайзером.
 
-The repository is intentionally structured as an independent package under `third_party/sonotide`, with its own CMake project, install rules, examples, tests, and design documents. The goal is to isolate COM, endpoint activation, format negotiation, and event-driven buffer handling behind a predictable runtime/stream model.
+Фреймворк задуман как отдельный пакет, а не как кусок приложения. У него свой
+CMake-проект, свои примеры, свои тесты и своя документация. Это удобно, когда
+нужно переиспользовать аудиошину в нескольких проектах и не тащить туда
+компактный, но всё же сложный Windows-специфичный слой.
 
-## Current Scope
+## Что умеет
 
-- Shared-mode event-driven render streams
-- Shared-mode event-driven capture streams
-- Shared-mode event-driven loopback capture streams
-- High-level playback sessions with `load / play / pause / seek / volume`
-- Built-in 10-band playback equalizer with presets, custom band gains, and headroom compensation
-- Playback-state snapshots with negotiated format and active output-device metadata
-- Device enumeration and default-device resolution
-- Explicit error model based on `sonotide::result<T>`
-- Threaded stream lifecycle with deterministic `start / stop / reset / close`
-- Windows-specific internals isolated under `src/internal/win/`
+- перечислять аудиоустройства и получать устройство по умолчанию;
+- открывать потоки вывода в shared-режиме с событийной моделью WASAPI;
+- открывать потоки захвата в shared-режиме с событийной моделью WASAPI;
+- открывать loopback-потоки в shared-режиме;
+- собирать сессию воспроизведения поверх `runtime` и декодера;
+- загружать и декодировать источники через Media Foundation на Windows;
+- применять встроенный 10-полосный эквалайзер с пресетами и компенсацией запаса по уровню;
+- хранить снимок состояния воспроизведения, включая согласованный формат и активное устройство;
+- использовать явную модель ошибок через `sonotide::result<T>`.
 
-## Repository Layout
+На платформах вне Windows проект тоже конфигурируется, но `runtime` там
+работает в режиме заглушки и возвращает `unsupported_platform`.
 
-- `include/sonotide/`: public API
-- `src/`: package implementation and internal runtime backends
-- `examples/`: minimal integration programs
-- `tests/`: unit tests for platform-neutral components
-- `docs/`: architecture, API, mapping, decisions, and migration materials
-- `cmake/`: package config templates
+## Структура репозитория
 
-## Build
+- `include/sonotide/` - публичный API фреймворка;
+- `src/` - реализация `runtime`, воспроизведения и внутренних backend-слоёв;
+- `examples/` - небольшие программы, показывающие типовые сценарии использования;
+- `tests/` - unit-тесты для платформенно-независимых частей;
+- `docs/` - архитектура, API, заметки по миграции и архитектурные решения;
+- `cmake/` - шаблоны и вспомогательные файлы для сборки и упаковки.
 
-Recommended on Windows and WSL:
+## Сборка
+
+Рекомендуемый путь для Windows и WSL - через preset `msvc-x64-debug`.
 
 ```bash
 "/mnt/c/Program Files/Microsoft Visual Studio/18/Professional/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe" --preset msvc-x64-debug
@@ -36,7 +45,8 @@ Recommended on Windows and WSL:
 "/mnt/c/Program Files/Microsoft Visual Studio/18/Professional/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/ctest.exe" --preset msvc-x64-debug
 ```
 
-If `cmake` is already in `PATH`, the same workflow is:
+Если `cmake` уже доступен в `PATH`, команды те же самые, только без полного
+пути к бинарю:
 
 ```bash
 cmake --preset msvc-x64-debug
@@ -44,21 +54,22 @@ cmake --build --preset msvc-x64-debug
 ctest --preset msvc-x64-debug
 ```
 
-If you run `ctest` manually against a Visual Studio build tree, remember that it is a multi-config generator and requires the configuration name:
+Если запускаешь `ctest` вручную против каталога сборки Visual Studio, не забудь
+указать конфигурацию:
 
 ```bash
 ctest --test-dir build/msvc-x64-debug -C Debug
 ```
 
-`Sonotide` is Windows-only at runtime. On non-Windows platforms the package still configures, but its stub backend returns `unsupported_platform`.
+## Быстрый пример
 
-Playback session support uses Media Foundation for source loading and decoding on Windows.
-Playback EQ runs in the render pipeline on decoded float PCM before conversion to the negotiated device format.
-Playback sessions also expose both the preferred output device id and the currently active endpoint metadata, which is useful when the system default device changes or recovery rebinds the stream.
-
-## Quick Example
+Ниже минимальный пример, который открывает поток вывода и пишет в него тишину.
+Это не полноценный плеер, а проверка того, что `runtime` и ветка вывода
+поднимаются корректно.
 
 ```cpp
+#include <algorithm>
+
 #include "sonotide/runtime.h"
 
 class silence_callback final : public sonotide::render_callback {
@@ -77,10 +88,10 @@ int main() {
         return 1;
     }
 
-    sonotide::runtime audio = std::move(runtime_result.value());
+    sonotide::runtime runtime = std::move(runtime_result.value());
     silence_callback callback;
 
-    auto stream_result = audio.open_render_stream({}, callback);
+    auto stream_result = runtime.open_render_stream({}, callback);
     if (!stream_result) {
         return 1;
     }
@@ -90,12 +101,17 @@ int main() {
 }
 ```
 
-## Design Priorities
+Для сценария воспроизведения есть отдельный пример в `examples/playback_session.cpp`.
+Он показывает, как фреймворк открывает файл, строит сессию воспроизведения и ведёт
+состояние воспроизведения без привязки к конкретному приложению.
 
-- Clean public API with no raw COM exposure
-- Clear ownership and explicit lifecycle
-- No god-objects and no helper dumps
-- Predictable callback threading and shutdown semantics
-- Direct mapping to real WASAPI constraints where it matters
+## Принципы
 
-See [docs/foundation.md](docs/foundation.md), [docs/architecture.md](docs/architecture.md), and [docs/api.md](docs/api.md) for the full engineering package.
+- публичный API не выставляет сырой COM наружу;
+- жизненный цикл объекта должен читаться без сюрпризов;
+- ошибки возвращаются явно, без исключений в горячем пути;
+- backend должен оставаться близким к реальному WASAPI-миру, а не прятать его;
+- верхний слой воспроизведения не обязан тащить в себя доменную логику приложения.
+
+Подробности по устройству фреймворка лежат в [docs/foundation.md](docs/foundation.md),
+[docs/architecture.md](docs/architecture.md) и [docs/api.md](docs/api.md).
