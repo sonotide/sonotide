@@ -2,6 +2,7 @@
 
 namespace sonotide {
 
+// Преобразует enum категории ошибки в стабильную текстовую метку для диагностики.
 std::string_view to_string(const error_category category) noexcept {
     switch (category) {
     case error_category::configuration:
@@ -23,6 +24,7 @@ std::string_view to_string(const error_category category) noexcept {
     return "platform";
 }
 
+// Преобразует enum кода ошибки в стабильную текстовую метку для диагностики.
 std::string_view to_string(const error_code code) noexcept {
     switch (code) {
     case error_code::invalid_argument:
@@ -57,4 +59,3 @@ std::string_view to_string(const error_code code) noexcept {
 }
 
 }  // namespace sonotide
-

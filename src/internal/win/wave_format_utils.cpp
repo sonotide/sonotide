@@ -7,6 +7,7 @@
 namespace sonotide::detail::win {
 namespace {
 
+/// Определяет публичный тип sample-ов, который соответствует нативному WAVE формату.
 sample_type detect_sample_type(const WAVEFORMATEX& format) {
     if (format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
         return sample_type::float32;
@@ -45,7 +46,9 @@ sample_type detect_sample_type(const WAVEFORMATEX& format) {
     return sample_type::unknown;
 }
 
+/// Строит extensible WAVE format на основе запрошенных публичных hints формата.
 result<unique_wave_format> make_requested_wave_format(const format_request& request) {
+    // Явная negotiation работает только тогда, когда вызывающий код передал все обязательные hints.
     if (!request.preferred_sample || !request.preferred_sample_rate ||
         !request.preferred_channel_count) {
         error failure;
@@ -57,6 +60,7 @@ result<unique_wave_format> make_requested_wave_format(const format_request& requ
         return result<unique_wave_format>::failure(std::move(failure));
     }
 
+    // Выделяем extensible format, потому что он может представлять float, PCM и valid-bit раскладки.
     auto format = unique_wave_format(
         reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE))));
     if (!format) {
@@ -76,6 +80,7 @@ result<unique_wave_format> make_requested_wave_format(const format_request& requ
     extensible->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
     extensible->dwChannelMask = (*request.preferred_channel_count >= 2) ? KSAUDIO_SPEAKER_STEREO : SPEAKER_FRONT_CENTER;
 
+    // Сопоставляем публичный тип sample-ов с соответствующим нативным subtype.
     switch (*request.preferred_sample) {
     case sample_type::float32:
         extensible->Format.wBitsPerSample = 32;
@@ -111,12 +116,14 @@ result<unique_wave_format> make_requested_wave_format(const format_request& requ
 
 }  // namespace
 
+/// Освобождает WAVEFORMATEX, выделенный через `CoTaskMemAlloc`.
 void cotaskmem_deleter::operator()(WAVEFORMATEX* format) const noexcept {
     if (format != nullptr) {
         CoTaskMemFree(format);
     }
 }
 
+/// Преобразует нативный WAVE format в публичную модель audio format Sonotide.
 audio_format to_audio_format(const WAVEFORMATEX& format) {
     audio_format public_format;
     public_format.sample = detect_sample_type(format);
@@ -137,6 +144,7 @@ audio_format to_audio_format(const WAVEFORMATEX& format) {
     return public_format;
 }
 
+/// Клонирует нативный WAVE format в отдельно владеющее выделение.
 result<unique_wave_format> clone_wave_format(const WAVEFORMATEX& source) {
     const auto total_size = sizeof(WAVEFORMATEX) + source.cbSize;
     auto cloned = unique_wave_format(
@@ -154,9 +162,11 @@ result<unique_wave_format> clone_wave_format(const WAVEFORMATEX& source) {
     return result<unique_wave_format>::success(std::move(cloned));
 }
 
+/// Согласовывает shared-mode format и возвращает и нативное, и публичное представления.
 result<negotiated_format> negotiate_shared_mode_format(
     IAudioClient& audio_client,
     const format_request& request) {
+    // Device mix format используется как запасной вариант, когда вызывающий код не запросил что-то явное.
     WAVEFORMATEX* mix_format_raw = nullptr;
     HRESULT hr = audio_client.GetMixFormat(&mix_format_raw);
     if (FAILED(hr) || mix_format_raw == nullptr) {
@@ -172,6 +182,7 @@ result<negotiated_format> negotiate_shared_mode_format(
     unique_wave_format mix_format(mix_format_raw);
     unique_wave_format selected_format;
 
+    // Если вызывающий код передал явные hints формата, сначала пытаемся выполнить именно их.
     if (request.preferred_sample && request.preferred_sample_rate &&
         request.preferred_channel_count) {
         auto requested_result = make_requested_wave_format(request);
@@ -190,6 +201,8 @@ result<negotiated_format> negotiate_shared_mode_format(
         } else if (hr == S_FALSE && closest_raw != nullptr && request.allow_mix_format_fallback) {
             selected_format.reset(closest_raw);
         } else if (request.allow_mix_format_fallback) {
+            // Переход на device mix format сохраняет работоспособность playback на endpoint-ах,
+            // которые не могут точно принять запрошенную раскладку.
             auto cloned_mix_result = clone_wave_format(*mix_format.get());
             if (!cloned_mix_result) {
                 return result<negotiated_format>::failure(cloned_mix_result.error());
@@ -208,6 +221,7 @@ result<negotiated_format> negotiate_shared_mode_format(
             return result<negotiated_format>::failure(std::move(failure));
         }
     } else {
+        // Без явных hints мы просто переиспользуем device mix format.
         auto cloned_mix_result = clone_wave_format(*mix_format.get());
         if (!cloned_mix_result) {
             return result<negotiated_format>::failure(cloned_mix_result.error());

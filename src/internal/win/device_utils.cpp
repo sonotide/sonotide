@@ -12,10 +12,12 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
+/// Преобразует публичное направление устройства в соответствующий поток данных Core Audio.
 EDataFlow to_data_flow(const device_direction direction) {
     return direction == device_direction::render ? eRender : eCapture;
 }
 
+/// Преобразует публичную роль устройства в соответствующую роль Core Audio.
 ERole to_role(const device_role role) {
     switch (role) {
     case device_role::console:
@@ -29,6 +31,7 @@ ERole to_role(const device_role role) {
     return eMultimedia;
 }
 
+/// Преобразует маску состояния Win32 endpoint в публичный enum `device_state`.
 device_state to_device_state(const DWORD state) {
     if ((state & DEVICE_STATE_ACTIVE) != 0U) {
         return device_state::active;
@@ -46,6 +49,7 @@ device_state to_device_state(const DWORD state) {
     return device_state::unknown;
 }
 
+/// Читает неизменяемый идентификатор endpoint-а и переводит его в UTF-8.
 result<std::string> get_device_id(IMMDevice& device) {
     LPWSTR raw_id = nullptr;
     const HRESULT hr = device.GetId(&raw_id);
@@ -65,6 +69,7 @@ result<std::string> get_device_id(IMMDevice& device) {
     return result<std::string>::success(utf8_from_utf16(wide_id));
 }
 
+/// Читает человекочитаемое имя endpoint-а из property store.
 result<std::string> get_friendly_name(IMMDevice& device) {
     ComPtr<IPropertyStore> store;
     HRESULT hr = device.OpenPropertyStore(STGM_READ, &store);
@@ -98,6 +103,7 @@ result<std::string> get_friendly_name(IMMDevice& device) {
 
 }  // namespace
 
+/// Создаёт системный MMDevice enumerator, который используют все пути обнаружения устройств.
 result<ComPtr<IMMDeviceEnumerator>> create_device_enumerator() {
     ComPtr<IMMDeviceEnumerator> enumerator;
     const HRESULT hr = CoCreateInstance(
@@ -116,11 +122,13 @@ result<ComPtr<IMMDeviceEnumerator>> create_device_enumerator() {
     return result<ComPtr<IMMDeviceEnumerator>>::success(std::move(enumerator));
 }
 
+/// Собирает публичную информацию об уже разрешённом endpoint-е.
 result<device_info> build_device_info(
     IMMDeviceEnumerator& enumerator,
     IMMDevice& device,
     const device_direction direction) {
     device_info info;
+    // Сохраняем направление в снимке, чтобы вызывающий код различал списки render и capture.
     info.direction = direction;
 
     auto id_result = get_device_id(device);
@@ -129,6 +137,7 @@ result<device_info> build_device_info(
     }
     info.id = std::move(id_result.value());
 
+    // Friendly name относится к UI-метаданным, но он всё равно должен попасть в публичный снимок.
     auto name_result = get_friendly_name(device);
     if (!name_result) {
         return result<device_info>::failure(name_result.error());
@@ -146,6 +155,7 @@ result<device_info> build_device_info(
     }
     info.state = to_device_state(raw_state);
 
+    // Фиксируем все флаги default-role, чтобы вызывающий код мог одинаково подсвечивать endpoint.
     for (const auto role : {device_role::console, device_role::multimedia, device_role::communications}) {
         ComPtr<IMMDevice> default_device;
         const HRESULT default_hr =
@@ -172,12 +182,14 @@ result<device_info> build_device_info(
     return result<device_info>::success(std::move(info));
 }
 
+/// Разрешает либо явный id endpoint-а, либо системное устройство по умолчанию.
 result<device_resolution> resolve_device(
     IMMDeviceEnumerator& enumerator,
     const device_selector& selector) {
     device_resolution resolution;
     HRESULT hr = S_OK;
 
+    // Явные id используются, когда вызывающий код хочет закрепить воспроизведение за известным endpoint-ом.
     if (selector.selection_mode == device_selector::mode::explicit_id) {
         const std::wstring device_id = utf16_from_utf8(selector.device_id);
         hr = enumerator.GetDevice(device_id.c_str(), &resolution.device);
@@ -189,6 +201,7 @@ result<device_resolution> resolve_device(
                 error_code::device_not_found));
         }
     } else {
+        // Выбор системного устройства по умолчанию - обычный путь при первом открытии потока.
         hr = enumerator.GetDefaultAudioEndpoint(
             to_data_flow(selector.direction),
             to_role(selector.role),
@@ -211,4 +224,3 @@ result<device_resolution> resolve_device(
 }
 
 }  // namespace sonotide::detail::win
-

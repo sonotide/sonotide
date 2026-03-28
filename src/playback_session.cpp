@@ -25,10 +25,12 @@
 namespace sonotide {
 namespace {
 
+// Преобразует громкость транспорта из пользовательского диапазона 0..100 в линейный коэффициент.
 float volume_percent_to_linear(const int volume_percent) {
     return static_cast<float>((std::clamp)(volume_percent, 0, 100)) / 100.0F;
 }
 
+// Сравнивает два согласованных аудиоформата, чтобы декодер переоткрывался только при необходимости.
 bool formats_match(const audio_format& left, const audio_format& right) {
     return left.sample == right.sample &&
            left.sample_rate == right.sample_rate &&
@@ -39,6 +41,7 @@ bool formats_match(const audio_format& left, const audio_format& right) {
            left.interleaved == right.interleaved;
 }
 
+// Сравнивает векторы усиления 10 полос с небольшим epsilon, чтобы детектирование пресета было устойчивым.
 bool band_gains_match(
     const std::array<equalizer_band, equalizer_band_count>& bands,
     const std::array<float, equalizer_band_count>& gains_db) {
@@ -51,10 +54,12 @@ bool band_gains_match(
     return true;
 }
 
+// Заполняет весь render buffer нулями, когда данных источника ещё нет.
 void write_silence(audio_buffer_view buffer) {
     std::fill(buffer.bytes.begin(), buffer.bytes.end(), std::byte{0});
 }
 
+// Преобразует декодированный float PCM в согласованный выходной формат до возврата из обратного вызова рендеринга.
 void convert_float_to_buffer(
     const float* source_samples,
     const std::uint32_t frame_count,
@@ -89,6 +94,7 @@ void convert_float_to_buffer(
     write_silence(audio_buffer_view{destination, frame_count, format});
 }
 
+// Собирает проектный объект ошибки, который используют методы playback_session.
 error make_error(
     const error_category category,
     const error_code code,
@@ -103,17 +109,24 @@ error make_error(
 }
 
 #if !defined(_WIN32)
+// Небольшой запасной блок для сборок не под Windows, чтобы код продолжал собираться.
 struct fallback_decoded_audio_block {
+    // Сырые декодированные PCM-сэмплы или эквивалент тишины.
     std::vector<float> samples;
+    // Текущая позиция воспроизведения в миллисекундах.
     std::int64_t position_ms = 0;
+    // Полная длительность источника в миллисекундах.
     std::int64_t duration_ms = 0;
+    // Сигнализирует, что декодер дошёл до конца источника.
     bool end_of_stream = false;
 };
 #endif
 
 #if defined(_WIN32)
+// В сборках под Windows используется реальный блок декодера Media Foundation.
 using decoded_audio_block_result = result<detail::win::decoded_audio_block>;
 #else
+// Сборки не под Windows используют запасной блок только для совместимости при компиляции.
 using decoded_audio_block_result = result<fallback_decoded_audio_block>;
 #endif
 
@@ -121,16 +134,20 @@ using decoded_audio_block_result = result<fallback_decoded_audio_block>;
 
 class playback_session::implementation {
 public:
+    // Создаёт полностью инициализированную сессию и сразу запускает поток рендеринга.
     static result<playback_session> create(
         std::shared_ptr<detail::runtime_backend> backend,
         const playback_session_config& config) {
+        // Сначала создаём объект, чтобы при ошибке открытия можно было безопасно вернуть структурированную ошибку.
         auto instance = std::unique_ptr<implementation>(
             new implementation(std::move(backend), config));
+        // Поток рендеринга должен быть открыт до того, как публичный объект будет возвращён.
         auto open_result = instance->open_render_stream();
         if (!open_result) {
             return result<playback_session>::failure(open_result.error());
         }
 
+        // Восстановление ждёт в отдельном потоке, чтобы обратный вызов рендеринга оставался лёгким.
         instance->recovery_thread_ = std::thread([owner = instance.get()]() {
             owner->recovery_loop();
         });
@@ -139,32 +156,39 @@ public:
             playback_session(std::move(instance)));
     }
 
+    // Сохраняет внутреннюю реализацию и конфигурацию сессии, затем инициализирует снимок воспроизведения.
     implementation(
         std::shared_ptr<detail::runtime_backend> backend,
         playback_session_config config)
         : backend_(std::move(backend)),
           config_(std::move(config)),
           callback_(*this) {
+        // Сохраняем запрошенное предпочтительное устройство, чтобы снимок отражал намерение вызывающего.
         state_.preferred_output_device_id =
             config_.render.device.selection_mode == device_selector::mode::explicit_id
                 ? config_.render.device.device_id
                 : "";
+        // Применяем стартовую громкость пользователя до первого вызова обратного вызова рендеринга.
         state_.volume_percent = (std::clamp)(config_.initial_volume_percent, 0, 100);
+        // Заполняем снимок эквалайзера, чтобы публичное состояние было осмысленным ещё до старта воспроизведения.
         populate_default_equalizer_state_locked();
         if (config_.initial_equalizer_state.has_value()) {
             (void)apply_equalizer_state(*config_.initial_equalizer_state);
         }
     }
 
+    // Гарантирует выполнение логики завершения даже если вызывающий не закрыл сессию явно.
     ~implementation() {
         close();
     }
 
+    // Показывает, владеет ли сессия ещё живым состоянием runtime.
     bool is_open() const noexcept {
         std::scoped_lock lock(mutex_);
         return !closed_;
     }
 
+    // Загружает новый URI источника и помечает сессию как требующую переинициализации декодера.
     result<void> load(std::string source_uri) {
         if (source_uri.empty()) {
             return result<void>::failure(make_error(
@@ -175,8 +199,10 @@ public:
         }
 
         std::scoped_lock lock(mutex_);
+        // Счётчики поколений позволяют обратному вызову рендеринга отличать устаревшие запросы на загрузку.
         requested_source_uri_ = std::move(source_uri);
         ++requested_source_generation_;
+        // Отложенный seek очищается, потому что новый источник должен стартовать с начала.
         pending_seek_ms_.reset();
         state_.source_uri = requested_source_uri_;
         state_.status = config_.auto_play_on_load ? playback_status::loading : playback_status::paused;
@@ -192,6 +218,7 @@ public:
         return result<void>::success();
     }
 
+    // Запрашивает запуск транспорта; реальная работа с декодером остаётся за рабочим потоком.
     result<void> play() {
         std::scoped_lock lock(mutex_);
         if (requested_source_uri_.empty()) {
@@ -215,6 +242,7 @@ public:
         return result<void>::success();
     }
 
+    // Запрашивает паузу транспорта, сохраняя загруженный источник и снимок таймлайна.
     result<void> pause() {
         std::scoped_lock lock(mutex_);
         playback_intent_playing_ = false;
@@ -223,6 +251,7 @@ public:
         return result<void>::success();
     }
 
+    // Планирует seek декодера на следующем тике обратного вызова рендеринга.
     result<void> seek_to(std::int64_t position_ms) {
         std::scoped_lock lock(mutex_);
         if (requested_source_uri_.empty()) {
@@ -241,6 +270,7 @@ public:
         return result<void>::success();
     }
 
+    // Сохраняет пользовательскую громкость в процентах, а слой DSP преобразует её позже.
     result<void> set_volume_percent(int volume_percent) {
         std::scoped_lock lock(mutex_);
         state_.volume_percent = (std::clamp)(volume_percent, 0, 100);

@@ -15,11 +15,14 @@
 namespace sonotide::detail::win {
 namespace {
 
+/// Преобразует временные метки Media Foundation в 100ns в миллисекунды для публичных снимков состояния.
 std::int64_t to_milliseconds(const std::int64_t value_100ns) {
     return value_100ns > 0 ? value_100ns / 10000 : 0;
 }
 
+/// Настраивает source reader на выдачу float PCM с целевой раскладкой каналов.
 result<void> configure_output_type(IMFSourceReader& source_reader, const audio_format& output_format) {
+    // Media Foundation выполнит декодирование и преобразование за нас, как только тип media будет зафиксирован.
     Microsoft::WRL::ComPtr<IMFMediaType> media_type;
     HRESULT hr = MFCreateMediaType(&media_type);
     if (FAILED(hr)) {
@@ -130,7 +133,9 @@ result<void> configure_output_type(IMFSourceReader& source_reader, const audio_f
     return result<void>::success();
 }
 
+/// Запрашивает длительность source, если media её предоставляет.
 std::int64_t query_duration_100ns(IMFSourceReader& source_reader) {
+    // Длительность необязательна, поэтому ошибки превращаются в "unknown duration", а не в жёсткий сбой.
     PROPVARIANT duration;
     PropVariantInit(&duration);
     const HRESULT hr = source_reader.GetPresentationAttribute(
@@ -154,9 +159,12 @@ std::int64_t query_duration_100ns(IMFSourceReader& source_reader) {
 
 }  // namespace
 
+/// Открывает новый Media Foundation source reader для переданного URI.
 result<void> media_foundation_decoder::open(const std::string& source_uri, const audio_format& output_format) {
+    // Повторное открытие всегда начинается с чистого состояния, чтобы устаревшее состояние не протекало между треками.
     close();
 
+    // Атрибуты низкой задержки сохраняют отзывчивость воспроизведения, когда буфер render небольшой.
     Microsoft::WRL::ComPtr<IMFAttributes> attributes;
     HRESULT hr = MFCreateAttributes(&attributes, 2);
     if (FAILED(hr)) {
@@ -185,6 +193,7 @@ result<void> media_foundation_decoder::open(const std::string& source_uri, const
             error_code::initialization_failed));
     }
 
+    // Media Foundation ожидает путь или URL в UTF-16.
     const std::wstring wide_source_uri = utf16_from_utf8(source_uri);
     hr = MFCreateSourceReaderFromURL(wide_source_uri.c_str(), attributes.Get(), &source_reader_);
     if (FAILED(hr)) {
@@ -210,6 +219,7 @@ result<void> media_foundation_decoder::open(const std::string& source_uri, const
     return result<void>::success();
 }
 
+/// Выполняет seek в source reader и отбрасывает все буферизованные decoded sample-ы.
 result<void> media_foundation_decoder::seek_to(const std::int64_t position_ms) {
     if (!source_reader_) {
         error failure;
@@ -241,7 +251,9 @@ result<void> media_foundation_decoder::seek_to(const std::int64_t position_ms) {
     return result<void>::success();
 }
 
+/// Возвращает decoded PCM block с точным числом frame-ов, запрошенным render path.
 result<decoded_audio_block> media_foundation_decoder::read_frames(const std::uint32_t frame_count) {
+    // Декодируем достаточно sample-ов, чтобы удовлетворить запрос, прежде чем собирать выходной блок.
     auto ensure_result = ensure_decoded_frames(frame_count);
     if (!ensure_result) {
         return result<decoded_audio_block>::failure(ensure_result.error());
@@ -279,6 +291,7 @@ result<decoded_audio_block> media_foundation_decoder::read_frames(const std::uin
     return result<decoded_audio_block>::success(std::move(block));
 }
 
+/// Освобождает source reader и очищает всё кешированное decode-состояние.
 void media_foundation_decoder::close() {
     source_reader_.Reset();
     decoded_samples_.clear();
@@ -289,19 +302,24 @@ void media_foundation_decoder::close() {
     output_format_ = {};
 }
 
+/// Сообщает, активен ли сейчас source reader.
 bool media_foundation_decoder::is_open() const noexcept {
     return static_cast<bool>(source_reader_);
 }
 
+/// Возвращает negotiated output format для текущего source.
 const audio_format& media_foundation_decoder::output_format() const noexcept {
     return output_format_;
 }
 
+/// Возвращает текущую длительность source в миллисекундах.
 std::int64_t media_foundation_decoder::duration_ms() const noexcept {
     return to_milliseconds(duration_100ns_);
 }
 
+/// Подтягивает из Media Foundation достаточно decoded sample-ов, чтобы удовлетворить запрос.
 result<void> media_foundation_decoder::ensure_decoded_frames(const std::uint32_t frame_count) {
+    // Если source reader исчез, decode больше невозможен.
     if (!source_reader_) {
         error failure;
         failure.category = error_category::stream;
@@ -313,8 +331,10 @@ result<void> media_foundation_decoder::ensure_decoded_frames(const std::uint32_t
 
     const std::size_t required_samples =
         static_cast<std::size_t>(frame_count) * output_format_.channel_count;
+    // Продолжаем чтение, пока в буфере не хватит sample-ов или source не сообщит EOS.
     while ((decoded_samples_.size() - decoded_sample_offset_) < required_samples &&
            !end_of_stream_) {
+        // Каждая итерация забирает следующий sample из Media Foundation и добавляет его в PCM cache.
         DWORD stream_index = 0;
         DWORD stream_flags = 0;
         LONGLONG sample_time = 0;
@@ -379,4 +399,3 @@ result<void> media_foundation_decoder::ensure_decoded_frames(const std::uint32_t
 }
 
 }  // namespace sonotide::detail::win
-

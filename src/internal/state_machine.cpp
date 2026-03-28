@@ -5,9 +5,11 @@
 namespace sonotide::detail {
 namespace {
 
+/// Формирует ошибку потока, поясняющую, какой переход был отклонён.
 error make_invalid_transition_error(
     const stream_state state,
     const stream_transition transition) {
+    /// В сообщении сохраняем текущее состояние и запрошенный переход, чтобы диагностика оставалась полезной.
     error failure;
     failure.category = error_category::stream;
     failure.code = error_code::invalid_state;
@@ -19,6 +21,7 @@ error make_invalid_transition_error(
     return failure;
 }
 
+/// Сопоставляет событие перехода с конкретным следующим состоянием потока.
 stream_state next_state(const stream_state current, const stream_transition transition) {
     switch (transition) {
     case stream_transition::prepare:
@@ -40,6 +43,7 @@ stream_state next_state(const stream_state current, const stream_transition tran
 
 }  // namespace
 
+/// Проверяет, допустим ли переход для указанного состояния жизненного цикла.
 bool stream_state_machine::can_transition(
     const stream_state current,
     const stream_transition transition) noexcept {
@@ -72,14 +76,15 @@ bool stream_state_machine::can_transition(
     return false;
 }
 
+/// Применяет допустимый переход и сохраняет получившийся снимок состояния.
 result<stream_state> stream_state_machine::transition(const stream_transition transition) {
     if (!can_transition(state_, transition)) {
         return result<stream_state>::failure(make_invalid_transition_error(state_, transition));
     }
 
+    /// Переход допустим, поэтому можно сдвинуть автомат вперёд за один шаг.
     state_ = next_state(state_, transition);
     return result<stream_state>::success(state_);
 }
 
-}  // namespace sonotide::detail
-
+}  // пространство имён sonotide::detail
