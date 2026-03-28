@@ -1,0 +1,6 @@
+add_executable(sonotide_list_devices list_devices.cpp)
+target_link_libraries(sonotide_list_devices PRIVATE Sonotide::sonotide)
+
+add_executable(sonotide_render_silence render_silence.cpp)
+target_link_libraries(sonotide_render_silence PRIVATE Sonotide::sonotide)
+

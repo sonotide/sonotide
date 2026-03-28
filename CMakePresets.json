@@ -1,0 +1,47 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "msvc-x64-debug",
+      "displayName": "MSVC x64 Debug",
+      "description": "Configure Sonotide with Visual Studio 2026 for x64 Debug builds.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/msvc-x64-debug",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/msvc-x64-debug",
+        "SONOTIDE_BUILD_EXAMPLES": "ON",
+        "SONOTIDE_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msvc-x64-debug",
+      "displayName": "Build MSVC x64 Debug",
+      "description": "Build Sonotide with the MSVC x64 Debug configure preset.",
+      "configurePreset": "msvc-x64-debug",
+      "configuration": "Debug"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "msvc-x64-debug",
+      "displayName": "Test MSVC x64 Debug",
+      "description": "Run Sonotide tests from the MSVC x64 Debug build tree.",
+      "configurePreset": "msvc-x64-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

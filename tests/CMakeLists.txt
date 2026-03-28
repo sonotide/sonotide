@@ -1,0 +1,9 @@
+add_executable(sonotide_result_tests unit/result_tests.cpp)
+target_link_libraries(sonotide_result_tests PRIVATE Sonotide::sonotide)
+add_test(NAME sonotide_result_tests COMMAND sonotide_result_tests)
+
+add_executable(sonotide_state_machine_tests unit/state_machine_tests.cpp)
+target_link_libraries(sonotide_state_machine_tests PRIVATE Sonotide::sonotide)
+target_include_directories(sonotide_state_machine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME sonotide_state_machine_tests COMMAND sonotide_state_machine_tests)
+
