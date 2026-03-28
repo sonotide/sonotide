@@ -111,6 +111,12 @@ struct fallback_decoded_audio_block {
 };
 #endif
 
+#if defined(_WIN32)
+using decoded_audio_block_result = result<detail::win::decoded_audio_block>;
+#else
+using decoded_audio_block_result = result<fallback_decoded_audio_block>;
+#endif
+
 }  // namespace
 
 class playback_session::implementation {
@@ -808,12 +814,12 @@ private:
 #endif
     }
 
-    auto read_decoder_frames(const std::uint32_t frame_count) {
+    decoded_audio_block_result read_decoder_frames(const std::uint32_t frame_count) {
 #if defined(_WIN32)
         return decoder_.read_frames(frame_count);
 #else
         (void)frame_count;
-        return result<fallback_decoded_audio_block>::failure(make_error(
+        return decoded_audio_block_result::failure(make_error(
             error_category::platform,
             error_code::unsupported_platform,
             "playback_session::read_decoder_frames",
