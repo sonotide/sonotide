@@ -11,6 +11,7 @@ option(SONOTIDE_BUILD_TESTS "Build Sonotide unit tests" ON)
 
 add_library(sonotide
     src/error.cpp
+    src/equalizer.cpp
     src/runtime.cpp
     src/playback_session.cpp
     src/render_stream.cpp

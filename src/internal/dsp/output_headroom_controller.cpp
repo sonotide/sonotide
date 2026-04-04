@@ -1,7 +1,6 @@
 #include "internal/dsp/output_headroom_controller.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <complex>
 
@@ -14,19 +13,6 @@ namespace {
 constexpr float kPi = 3.14159265358979323846F;
 /// Тот же коэффициент Q, что и в EQ chain, чтобы оценка запаса по уровню совпадала с рабочим путём.
 constexpr float kEqualizerQ = 1.414F;
-/// Фиксированные центральные частоты, зеркально повторяющие EQ chain.
-constexpr std::array<float, equalizer_band_count> kBandFrequenciesHz{
-    60.0F,
-    170.0F,
-    310.0F,
-    600.0F,
-    1000.0F,
-    3000.0F,
-    6000.0F,
-    12000.0F,
-    14000.0F,
-    16000.0F,
-};
 
 /// Вычисляет частотную характеристику одного biquad в децибелах.
 float evaluate_frequency_response_db(
@@ -51,9 +37,9 @@ float evaluate_frequency_response_db(
 
 /// Вычисляет консервативное значение предусиления, уменьшающее риск клиппинга.
 float output_headroom_controller::compute_target_preamp_db(
-    const std::array<float, equalizer_band_count>& band_gains_db,
+    const std::span<const equalizer_band> bands,
     const float sample_rate) const {
-    if (sample_rate <= 0.0F) {
+    if (sample_rate <= 0.0F || bands.empty()) {
         /// Без валидной частоты дискретизации безопасно оценить отклик полос невозможно.
         return 0.0F;
     }
@@ -70,13 +56,13 @@ float output_headroom_controller::compute_target_preamp_db(
             (std::min)(20.0F * std::pow(1000.0F, ratio), sample_rate * 0.45F);
         float response_db = 0.0F;
 
-        for (std::size_t band_index = 0; band_index < band_gains_db.size(); ++band_index) {
+        for (const equalizer_band& band : bands) {
             /// Каждая EQ-полоса вносит вклад в общую оценку АЧХ.
             const biquad_coefficients coefficients = make_peaking_coefficients(
                 sample_rate,
-                kBandFrequenciesHz[band_index],
+                band.center_frequency_hz,
                 kEqualizerQ,
-                band_gains_db[band_index]);
+                band.gain_db);
             response_db += evaluate_frequency_response_db(coefficients, frequency_hz / sample_rate);
         }
 

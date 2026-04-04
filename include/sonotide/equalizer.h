@@ -1,15 +1,18 @@
 #pragma once
 
-#include <array>
+#include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace sonotide {
 
-/// Количество фиксированных полос, которые экспонирует встроенный эквалайзер Sonotide.
-inline constexpr std::size_t equalizer_band_count = 10;
+/// Максимальное число полос, которое экспонирует встроенный эквалайзер Sonotide.
+inline constexpr std::size_t equalizer_max_band_count = 10;
+/// Исторический псевдоним, сохранённый для совместимости со старым 10-band API.
+inline constexpr std::size_t equalizer_band_count = equalizer_max_band_count;
 
 /// Поддерживаемые пресеты эквалайзера, которые экспонирует framework.
 enum class equalizer_preset_id {
@@ -61,22 +64,59 @@ enum class equalizer_status {
     error,
 };
 
-/// Одна полоса 10-band эквалайзера.
+/// Одна настраиваемая полоса эквалайзера.
 struct equalizer_band {
-    /// Фиксированная центральная частота полосы в Hz.
+    /// Центральная частота полосы в Hz.
     float center_frequency_hz = 0.0F;
     /// Усиление, применяемое к полосе, в dB.
     float gain_db = 0.0F;
 };
 
-/// Определение встроенного preset с заголовком и 10 band gains.
+/// Глобальные ограничения количества полос EQ.
+struct equalizer_band_count_limits {
+    /// Минимально допустимое число полос.
+    std::size_t min_band_count = 0;
+    /// Максимально допустимое число полос.
+    std::size_t max_band_count = equalizer_max_band_count;
+};
+
+/// Глобальные ограничения положения полос по частоте.
+struct equalizer_frequency_limits {
+    /// Минимально допустимая центральная частота полосы.
+    float min_frequency_hz = 20.0F;
+    /// Максимально допустимая центральная частота полосы.
+    float max_frequency_hz = 20000.0F;
+    /// Минимальный зазор между соседними полосами.
+    float min_band_spacing_hz = 10.0F;
+};
+
+/// Диапазон, внутри которого можно перемещать конкретную полосу, не ломая ограничения.
+struct equalizer_frequency_range {
+    /// Нижняя допустимая граница частоты полосы.
+    float min_frequency_hz = 20.0F;
+    /// Верхняя допустимая граница частоты полосы.
+    float max_frequency_hz = 20000.0F;
+};
+
+/// Возвращает поддерживаемый диапазон количества полос.
+[[nodiscard]] equalizer_band_count_limits supported_equalizer_band_count_limits() noexcept;
+/// Возвращает поддерживаемый глобальный диапазон частот и минимальный зазор полос.
+[[nodiscard]] equalizer_frequency_limits supported_equalizer_frequency_limits() noexcept;
+/// Возвращает стандартную раскладку полос Sonotide для запрошенного количества полос.
+[[nodiscard]] std::vector<equalizer_band> make_default_equalizer_bands(std::size_t band_count);
+/// Возвращает диапазон частот, доступный для перемещения конкретной полосы в текущей раскладке.
+[[nodiscard]] std::optional<equalizer_frequency_range> equalizer_band_editable_frequency_range(
+    std::span<const equalizer_band> bands,
+    std::size_t band_index) noexcept;
+
+/// Определение встроенного preset с заголовком и reference gain-кривой.
 struct equalizer_preset {
     /// Идентификатор preset.
     equalizer_preset_id id = equalizer_preset_id::flat;
     /// Человекочитаемый заголовок preset.
     const char* title = "Flat";
-    /// Усиление по каждой полосе в dB.
-    std::array<float, equalizer_band_count> gains_db{};
+    /// Усиление reference-полос пресета в dB.
+    std::vector<float> gains_db;
 };
 
 /// Снимок конфигурации эквалайзера и вычисленных метаданных.
@@ -88,9 +128,10 @@ struct equalizer_state {
     /// Текущий активный preset id.
     equalizer_preset_id active_preset_id = equalizer_preset_id::flat;
     /// Текущие gain полос.
-    std::array<equalizer_band, equalizer_band_count> bands{};
+    std::vector<equalizer_band> bands = make_default_equalizer_bands(equalizer_max_band_count);
     /// Последний пользовательский non-flat snapshot полос.
-    std::array<float, equalizer_band_count> last_nonflat_band_gains_db{};
+    std::vector<float> last_nonflat_band_gains_db =
+        std::vector<float>(equalizer_max_band_count, 0.0F);
     /// Встроенные presets, доступные вызывающему коду.
     std::vector<equalizer_preset> available_presets;
     /// Дополнительный output level после EQ processing.

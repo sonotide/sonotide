@@ -1,6 +1,6 @@
 #pragma once
 
-#include <array>
+#include <span>
 
 #include "sonotide/equalizer.h"
 
@@ -11,7 +11,7 @@ class output_headroom_controller {
 public:
     /// Возвращает рекомендуемое ослабление предусиления в децибелах.
     [[nodiscard]] float compute_target_preamp_db(
-        const std::array<float, equalizer_band_count>& band_gains_db,
+        std::span<const equalizer_band> bands,
         float sample_rate) const;
 };
 

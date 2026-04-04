@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
@@ -30,6 +31,13 @@ float volume_percent_to_linear(const int volume_percent) {
     return static_cast<float>((std::clamp)(volume_percent, 0, 100)) / 100.0F;
 }
 
+constexpr float kMinEqualizerGainDb = -12.0F;
+constexpr float kMaxEqualizerGainDb = 12.0F;
+
+float clamp_equalizer_gain_db(const float gain_db) {
+    return (std::clamp)(gain_db, kMinEqualizerGainDb, kMaxEqualizerGainDb);
+}
+
 // Сравнивает два согласованных аудиоформата, чтобы декодер переоткрывался только при необходимости.
 bool formats_match(const audio_format& left, const audio_format& right) {
     return left.sample == right.sample &&
@@ -41,10 +49,14 @@ bool formats_match(const audio_format& left, const audio_format& right) {
            left.interleaved == right.interleaved;
 }
 
-// Сравнивает векторы усиления 10 полос с небольшим epsilon, чтобы детектирование пресета было устойчивым.
+// Сравнивает текущие band gains с эталонной кривой пресета.
 bool band_gains_match(
-    const std::array<equalizer_band, equalizer_band_count>& bands,
-    const std::array<float, equalizer_band_count>& gains_db) {
+    const std::span<const equalizer_band> bands,
+    const std::span<const float> gains_db) {
+    if (bands.size() != gains_db.size()) {
+        return false;
+    }
+
     for (std::size_t index = 0; index < bands.size(); ++index) {
         if (std::fabs(bands[index].gain_db - gains_db[index]) > 0.01F) {
             return false;
@@ -52,6 +64,111 @@ bool band_gains_match(
     }
 
     return true;
+}
+
+// Интерполирует reference gain-кривую пресета в текущие пользовательские частоты полос.
+std::vector<float> project_preset_gains_to_bands(
+    const equalizer_preset& preset,
+    const std::span<const equalizer_band> target_bands) {
+    std::vector<float> projected_gains_db;
+    projected_gains_db.reserve(target_bands.size());
+
+    if (target_bands.empty()) {
+        return projected_gains_db;
+    }
+    if (preset.gains_db.empty()) {
+        projected_gains_db.assign(target_bands.size(), 0.0F);
+        return projected_gains_db;
+    }
+
+    const std::vector<equalizer_band> preset_reference_bands =
+        make_default_equalizer_bands(preset.gains_db.size());
+    if (preset_reference_bands.empty()) {
+        projected_gains_db.assign(target_bands.size(), 0.0F);
+        return projected_gains_db;
+    }
+
+    for (const equalizer_band& band : target_bands) {
+        if (band.center_frequency_hz <= preset_reference_bands.front().center_frequency_hz) {
+            projected_gains_db.push_back(preset.gains_db.front());
+            continue;
+        }
+        if (band.center_frequency_hz >= preset_reference_bands.back().center_frequency_hz) {
+            projected_gains_db.push_back(preset.gains_db.back());
+            continue;
+        }
+
+        const auto upper_iterator = std::upper_bound(
+            preset_reference_bands.begin(),
+            preset_reference_bands.end(),
+            band.center_frequency_hz,
+            [](const float frequency_hz, const equalizer_band& reference_band) {
+                return frequency_hz < reference_band.center_frequency_hz;
+            });
+        const std::size_t upper_index = static_cast<std::size_t>(
+            std::distance(preset_reference_bands.begin(), upper_iterator));
+        const std::size_t lower_index = upper_index - 1U;
+
+        const float lower_frequency_hz = preset_reference_bands[lower_index].center_frequency_hz;
+        const float upper_frequency_hz = preset_reference_bands[upper_index].center_frequency_hz;
+        const float lower_gain_db = preset.gains_db[lower_index];
+        const float upper_gain_db = preset.gains_db[upper_index];
+        const float lower_log_frequency = std::log(lower_frequency_hz);
+        const float upper_log_frequency = std::log(upper_frequency_hz);
+        const float target_log_frequency = std::log(band.center_frequency_hz);
+        const float interpolation =
+            (target_log_frequency - lower_log_frequency) /
+            (upper_log_frequency - lower_log_frequency);
+
+        projected_gains_db.push_back(
+            lower_gain_db + (upper_gain_db - lower_gain_db) * interpolation);
+    }
+
+    return projected_gains_db;
+}
+
+// Нормализует пользовательскую раскладку полос: сортирует, ограничивает диапазон и выдерживает минимальный зазор.
+std::vector<equalizer_band> normalize_equalizer_bands(std::span<const equalizer_band> bands) {
+    std::vector<equalizer_band> normalized_bands(bands.begin(), bands.end());
+    const equalizer_frequency_limits frequency_limits = supported_equalizer_frequency_limits();
+
+    std::sort(
+        normalized_bands.begin(),
+        normalized_bands.end(),
+        [](const equalizer_band& left, const equalizer_band& right) {
+            return left.center_frequency_hz < right.center_frequency_hz;
+        });
+
+    for (equalizer_band& band : normalized_bands) {
+        band.center_frequency_hz = (std::clamp)(
+            band.center_frequency_hz,
+            frequency_limits.min_frequency_hz,
+            frequency_limits.max_frequency_hz);
+        band.gain_db = clamp_equalizer_gain_db(band.gain_db);
+    }
+
+    for (std::size_t index = 1; index < normalized_bands.size(); ++index) {
+        normalized_bands[index].center_frequency_hz = (std::max)(
+            normalized_bands[index].center_frequency_hz,
+            normalized_bands[index - 1U].center_frequency_hz + frequency_limits.min_band_spacing_hz);
+    }
+
+    if (!normalized_bands.empty()) {
+        normalized_bands.back().center_frequency_hz = (std::min)(
+            normalized_bands.back().center_frequency_hz,
+            frequency_limits.max_frequency_hz);
+    }
+
+    for (std::size_t index = normalized_bands.size(); index > 1U; --index) {
+        normalized_bands[index - 2U].center_frequency_hz = (std::min)(
+            normalized_bands[index - 2U].center_frequency_hz,
+            normalized_bands[index - 1U].center_frequency_hz - frequency_limits.min_band_spacing_hz);
+        normalized_bands[index - 2U].center_frequency_hz = (std::max)(
+            normalized_bands[index - 2U].center_frequency_hz,
+            frequency_limits.min_frequency_hz);
+    }
+
+    return normalized_bands;
 }
 
 // Заполняет весь render buffer нулями, когда данных источника ещё нет.
@@ -304,8 +421,11 @@ public:
                 "Unknown equalizer preset."));
         }
 
+        const std::vector<float> projected_gains_db = project_preset_gains_to_bands(
+            *preset_iterator,
+            equalizer_state_.bands);
         for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
-            equalizer_state_.bands[index].gain_db = preset_iterator->gains_db[index];
+            equalizer_state_.bands[index].gain_db = projected_gains_db[index];
         }
         equalizer_state_.active_preset_id = preset_id;
         update_last_nonflat_state_locked();
@@ -320,10 +440,119 @@ public:
                 error_category::configuration,
                 error_code::invalid_argument,
                 "playback_session::set_equalizer_band_gain",
-                "Equalizer band index is outside of the supported 10-band range."));
+                "Equalizer band index is outside of the active band range."));
         }
 
-        equalizer_state_.bands[band_index].gain_db = (std::clamp)(gain_db, -12.0F, 12.0F);
+        equalizer_state_.bands[band_index].gain_db = clamp_equalizer_gain_db(gain_db);
+        recalculate_active_preset_locked();
+        update_last_nonflat_state_locked();
+        recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
+        return result<void>::success();
+    }
+
+    result<void> add_equalizer_band(const float center_frequency_hz, const float gain_db) {
+        std::scoped_lock lock(mutex_);
+        if (equalizer_state_.bands.size() >= supported_equalizer_band_count_limits().max_band_count) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::add_equalizer_band",
+                "Equalizer already uses the maximum supported number of bands."));
+        }
+
+        const equalizer_frequency_limits frequency_limits = supported_equalizer_frequency_limits();
+        const float clamped_frequency_hz = (std::clamp)(
+            center_frequency_hz,
+            frequency_limits.min_frequency_hz,
+            frequency_limits.max_frequency_hz);
+        const auto insert_iterator = std::lower_bound(
+            equalizer_state_.bands.begin(),
+            equalizer_state_.bands.end(),
+            clamped_frequency_hz,
+            [](const equalizer_band& band, const float frequency_hz) {
+                return band.center_frequency_hz < frequency_hz;
+            });
+        const std::size_t insert_index = static_cast<std::size_t>(
+            std::distance(equalizer_state_.bands.begin(), insert_iterator));
+
+        float min_frequency_hz = frequency_limits.min_frequency_hz;
+        float max_frequency_hz = frequency_limits.max_frequency_hz;
+        if (insert_index > 0U) {
+            min_frequency_hz = (std::max)(
+                min_frequency_hz,
+                equalizer_state_.bands[insert_index - 1U].center_frequency_hz +
+                    frequency_limits.min_band_spacing_hz);
+        }
+        if (insert_index < equalizer_state_.bands.size()) {
+            max_frequency_hz = (std::min)(
+                max_frequency_hz,
+                equalizer_state_.bands[insert_index].center_frequency_hz -
+                    frequency_limits.min_band_spacing_hz);
+        }
+        if (min_frequency_hz > max_frequency_hz) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::add_equalizer_band",
+                "No valid frequency slot is available for another equalizer band."));
+        }
+
+        equalizer_state_.bands.insert(
+            insert_iterator,
+            equalizer_band{
+                .center_frequency_hz = (std::clamp)(clamped_frequency_hz, min_frequency_hz, max_frequency_hz),
+                .gain_db = clamp_equalizer_gain_db(gain_db),
+            });
+        update_last_nonflat_state_locked();
+        recalculate_active_preset_locked();
+        recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
+        return result<void>::success();
+    }
+
+    result<void> remove_equalizer_band(const std::size_t band_index) {
+        std::scoped_lock lock(mutex_);
+        if (band_index >= equalizer_state_.bands.size()) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::remove_equalizer_band",
+                "Equalizer band index is outside of the active band range."));
+        }
+
+        equalizer_state_.bands.erase(equalizer_state_.bands.begin() + static_cast<std::ptrdiff_t>(band_index));
+        update_last_nonflat_state_locked();
+        recalculate_active_preset_locked();
+        recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
+        return result<void>::success();
+    }
+
+    result<void> set_equalizer_band_frequency(
+        const std::size_t band_index,
+        const float center_frequency_hz) {
+        std::scoped_lock lock(mutex_);
+        if (band_index >= equalizer_state_.bands.size()) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::set_equalizer_band_frequency",
+                "Equalizer band index is outside of the active band range."));
+        }
+
+        const auto editable_range = sonotide::equalizer_band_editable_frequency_range(
+            equalizer_state_.bands,
+            band_index);
+        if (!editable_range.has_value()) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::set_equalizer_band_frequency",
+                "The requested band cannot be moved because its editable range is unavailable."));
+        }
+
+        equalizer_state_.bands[band_index].center_frequency_hz = (std::clamp)(
+            center_frequency_hz,
+            editable_range->min_frequency_hz,
+            editable_range->max_frequency_hz);
         recalculate_active_preset_locked();
         update_last_nonflat_state_locked();
         recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
@@ -344,19 +573,32 @@ public:
 
     result<void> set_equalizer_output_gain(const float output_gain_db) {
         std::scoped_lock lock(mutex_);
-        equalizer_state_.output_gain_db = (std::clamp)(output_gain_db, -12.0F, 12.0F);
+        equalizer_state_.output_gain_db = clamp_equalizer_gain_db(output_gain_db);
         return result<void>::success();
     }
 
     result<void> apply_equalizer_state(const sonotide::equalizer_state& state) {
         std::scoped_lock lock(mutex_);
-        equalizer_state_.enabled = state.enabled;
-        for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
-            equalizer_state_.bands[index].gain_db = (std::clamp)(state.bands[index].gain_db, -12.0F, 12.0F);
-            equalizer_state_.last_nonflat_band_gains_db[index] = state.last_nonflat_band_gains_db[index];
+        if (state.bands.size() > supported_equalizer_band_count_limits().max_band_count) {
+            return result<void>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::apply_equalizer_state",
+                "Equalizer state exceeds the maximum supported number of bands."));
         }
-        equalizer_state_.output_gain_db = (std::clamp)(state.output_gain_db, -12.0F, 12.0F);
+
+        equalizer_state_.enabled = state.enabled;
+        equalizer_state_.bands = normalize_equalizer_bands(state.bands);
+        equalizer_state_.last_nonflat_band_gains_db.assign(equalizer_state_.bands.size(), 0.0F);
+        for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
+            if (index < state.last_nonflat_band_gains_db.size()) {
+                equalizer_state_.last_nonflat_band_gains_db[index] =
+                    clamp_equalizer_gain_db(state.last_nonflat_band_gains_db[index]);
+            }
+        }
+        equalizer_state_.output_gain_db = clamp_equalizer_gain_db(state.output_gain_db);
         recalculate_active_preset_locked();
+        update_last_nonflat_state_locked();
         recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
         return result<void>::success();
     }
@@ -402,6 +644,12 @@ public:
         return equalizer_state_;
     }
 
+    std::optional<sonotide::equalizer_frequency_range> equalizer_band_frequency_range(
+        const std::size_t band_index) const {
+        std::scoped_lock lock(mutex_);
+        return sonotide::equalizer_band_editable_frequency_range(equalizer_state_.bands, band_index);
+    }
+
     result<void> close() {
         {
             std::scoped_lock lock(mutex_);
@@ -435,7 +683,7 @@ public:
         bool reached_end_of_stream = false;
         bool equalizer_enabled = false;
         float equalizer_output_gain_db = 0.0F;
-        std::array<float, equalizer_band_count> equalizer_band_gains_db{};
+        std::vector<equalizer_band> equalizer_bands;
 
         {
             std::scoped_lock lock(mutex_);
@@ -448,9 +696,7 @@ public:
             reached_end_of_stream = reached_end_of_stream_;
             equalizer_enabled = equalizer_state_.enabled;
             equalizer_output_gain_db = equalizer_state_.output_gain_db;
-            for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
-                equalizer_band_gains_db[index] = equalizer_state_.bands[index].gain_db;
-            }
+            equalizer_bands = equalizer_state_.bands;
             if (!source_uri.empty()) {
                 should_open_decoder =
                     !decoder_ready_ ||
@@ -523,7 +769,7 @@ public:
 
         apply_equalizer_runtime_targets(
             equalizer_enabled,
-            equalizer_band_gains_db,
+            equalizer_bands,
             equalizer_output_gain_db,
             volume_percent);
         equalizer_chain_.process(decoded_result.value().samples.data(), buffer.frame_count);
@@ -682,13 +928,8 @@ private:
     void populate_default_equalizer_state_locked() {
         equalizer_state_.available_presets = available_equalizer_presets_;
         equalizer_state_.status = equalizer_status::loading;
-        for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
-            equalizer_state_.bands[index] = equalizer_band{
-                .center_frequency_hz = detail::dsp::equalizer_chain::band_frequencies_hz()[index],
-                .gain_db = 0.0F,
-            };
-            equalizer_state_.last_nonflat_band_gains_db[index] = 0.0F;
-        }
+        equalizer_state_.bands = make_default_equalizer_bands(equalizer_max_band_count);
+        equalizer_state_.last_nonflat_band_gains_db.assign(equalizer_state_.bands.size(), 0.0F);
         equalizer_state_.active_preset_id = equalizer_preset_id::flat;
         equalizer_state_.output_gain_db = 0.0F;
         equalizer_state_.headroom_compensation_db = 0.0F;
@@ -701,7 +942,10 @@ private:
                 continue;
             }
 
-            if (band_gains_match(equalizer_state_.bands, preset.gains_db)) {
+            const std::vector<float> projected_gains_db = project_preset_gains_to_bands(
+                preset,
+                equalizer_state_.bands);
+            if (band_gains_match(equalizer_state_.bands, projected_gains_db)) {
                 equalizer_state_.active_preset_id = preset.id;
                 return;
             }
@@ -711,6 +955,10 @@ private:
     }
 
     void update_last_nonflat_state_locked() {
+        if (equalizer_state_.last_nonflat_band_gains_db.size() != equalizer_state_.bands.size()) {
+            equalizer_state_.last_nonflat_band_gains_db.assign(equalizer_state_.bands.size(), 0.0F);
+        }
+
         bool is_flat = true;
         for (const equalizer_band& band : equalizer_state_.bands) {
             if (std::fabs(band.gain_db) > 0.01F) {
@@ -729,13 +977,8 @@ private:
     }
 
     void recompute_equalizer_metadata_locked(const float sample_rate) {
-        std::array<float, equalizer_band_count> band_gains_db{};
-        for (std::size_t index = 0; index < equalizer_state_.bands.size(); ++index) {
-            band_gains_db[index] = equalizer_state_.bands[index].gain_db;
-        }
-
         equalizer_state_.headroom_compensation_db =
-            headroom_controller_.compute_target_preamp_db(band_gains_db, sample_rate);
+            headroom_controller_.compute_target_preamp_db(equalizer_state_.bands, sample_rate);
         if (equalizer_state_.status != equalizer_status::audio_engine_unavailable &&
             equalizer_state_.status != equalizer_status::unsupported_audio_path) {
             equalizer_state_.status = equalizer_status::ready;
@@ -771,14 +1014,14 @@ private:
 
     void apply_equalizer_runtime_targets(
         const bool enabled,
-        const std::array<float, equalizer_band_count>& band_gains_db,
+        const std::span<const equalizer_band> bands,
         const float output_gain_db,
         const int volume_percent) {
         if (!equalizer_configured_) {
             return;
         }
 
-        equalizer_chain_.set_band_gains(band_gains_db);
+        equalizer_chain_.set_bands(bands);
         equalizer_chain_.set_enabled(enabled);
         equalizer_chain_.set_output_gain_db(output_gain_db);
         equalizer_chain_.set_volume_linear(volume_percent_to_linear(volume_percent));
@@ -996,6 +1239,43 @@ result<void> playback_session::set_equalizer_band_gain(
     return implementation_->set_equalizer_band_gain(band_index, gain_db);
 }
 
+result<void> playback_session::add_equalizer_band(
+    const float center_frequency_hz,
+    const float gain_db) {
+    if (!implementation_) {
+        return result<void>::failure(make_error(
+            error_category::stream,
+            error_code::invalid_state,
+            "playback_session::add_equalizer_band",
+            "Playback session is not open."));
+    }
+    return implementation_->add_equalizer_band(center_frequency_hz, gain_db);
+}
+
+result<void> playback_session::remove_equalizer_band(const std::size_t band_index) {
+    if (!implementation_) {
+        return result<void>::failure(make_error(
+            error_category::stream,
+            error_code::invalid_state,
+            "playback_session::remove_equalizer_band",
+            "Playback session is not open."));
+    }
+    return implementation_->remove_equalizer_band(band_index);
+}
+
+result<void> playback_session::set_equalizer_band_frequency(
+    const std::size_t band_index,
+    const float center_frequency_hz) {
+    if (!implementation_) {
+        return result<void>::failure(make_error(
+            error_category::stream,
+            error_code::invalid_state,
+            "playback_session::set_equalizer_band_frequency",
+            "Playback session is not open."));
+    }
+    return implementation_->set_equalizer_band_frequency(band_index, center_frequency_hz);
+}
+
 result<void> playback_session::reset_equalizer() {
     if (!implementation_) {
         return result<void>::failure(make_error(
@@ -1063,6 +1343,14 @@ sonotide::equalizer_state playback_session::equalizer_state() const {
         return {};
     }
     return implementation_->equalizer_state();
+}
+
+std::optional<sonotide::equalizer_frequency_range> playback_session::equalizer_band_frequency_range(
+    const std::size_t band_index) const {
+    if (!implementation_) {
+        return std::nullopt;
+    }
+    return implementation_->equalizer_band_frequency_range(band_index);
 }
 
 result<void> playback_session::close() {

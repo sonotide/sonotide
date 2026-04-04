@@ -68,6 +68,12 @@ public:
     result<void> select_equalizer_preset(equalizer_preset_id preset_id);
     /// Устанавливает gain для одной полосы EQ.
     result<void> set_equalizer_band_gain(std::size_t band_index, float gain_db);
+    /// Добавляет новую полосу EQ в допустимую частотную позицию.
+    result<void> add_equalizer_band(float center_frequency_hz, float gain_db = 0.0F);
+    /// Удаляет существующую полосу EQ по индексу.
+    result<void> remove_equalizer_band(std::size_t band_index);
+    /// Перемещает центральную частоту полосы EQ в допустимых границах.
+    result<void> set_equalizer_band_frequency(std::size_t band_index, float center_frequency_hz);
     /// Восстанавливает плоское состояние эквалайзера.
     result<void> reset_equalizer();
     /// Устанавливает выходной gain, применяемый после обработки EQ.
@@ -82,6 +88,9 @@ public:
     [[nodiscard]] playback_state state() const;
     /// Возвращает текущий снимок эквалайзера.
     [[nodiscard]] equalizer_state equalizer_state() const;
+    /// Возвращает допустимый диапазон частот для конкретной полосы текущего EQ-layout.
+    [[nodiscard]] std::optional<equalizer_frequency_range> equalizer_band_frequency_range(
+        std::size_t band_index) const;
     /// Закрывает сессию и освобождает runtime resources.
     result<void> close();
 

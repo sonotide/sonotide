@@ -1,26 +1,11 @@
 #include "internal/dsp/equalizer_chain.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <vector>
 
 namespace sonotide::detail::dsp {
 namespace {
-
-/// Фиксированные центральные частоты 10-полосного EQ, зеркалящие публичную модель эквалайзера.
-constexpr std::array<float, equalizer_band_count> kBandFrequenciesHz{
-    60.0F,
-    170.0F,
-    310.0F,
-    600.0F,
-    1000.0F,
-    3000.0F,
-    6000.0F,
-    12000.0F,
-    14000.0F,
-    16000.0F,
-};
 
 /// Коэффициент Q подобран так, чтобы peaking EQ-кривая была музыкально полезной.
 constexpr float kEqualizerQ = 1.414F;
@@ -41,6 +26,16 @@ std::size_t ramp_samples_for_rate(const float sample_rate) {
         : 0U;
 }
 
+std::array<float, equalizer_max_band_count> default_band_frequencies_hz() {
+    std::array<float, equalizer_max_band_count> frequencies{};
+    const std::vector<equalizer_band> bands = make_default_equalizer_bands(equalizer_max_band_count);
+    for (std::size_t index = 0; index < bands.size(); ++index) {
+        frequencies[index] = bands[index].center_frequency_hz;
+    }
+
+    return frequencies;
+}
+
 }  // namespace
 
 /// Конфигурирует EQ-цепочку под конкретный формат вывода.
@@ -48,14 +43,28 @@ void equalizer_chain::configure(const float sample_rate, const std::size_t chann
     /// Сначала сохраняем новые параметры выполнения, чтобы последующие методы установки использовали их сразу.
     sample_rate_ = sample_rate;
     channel_count_ = channel_count;
+    const std::array<float, equalizer_max_band_count> default_frequencies_hz =
+        default_band_frequencies_hz();
 
     for (std::size_t band_index = 0; band_index < filters_.size(); ++band_index) {
+        if (target_band_frequencies_hz_[band_index] <= 0.0F) {
+            target_band_frequencies_hz_[band_index] = default_frequencies_hz[band_index];
+        }
+        if (current_band_frequencies_hz_[band_index] <= 0.0F) {
+            current_band_frequencies_hz_[band_index] = target_band_frequencies_hz_[band_index];
+        }
+
         /// Каждая полоса на старте конфигурируется нейтральным набором коэффициентов.
         filters_[band_index].configure(
             channel_count_,
-            make_peaking_coefficients(sample_rate_, kBandFrequenciesHz[band_index], kEqualizerQ, 0.0F));
+            make_peaking_coefficients(
+                sample_rate_,
+                target_band_frequencies_hz_[band_index],
+                kEqualizerQ,
+                current_band_gains_db_[band_index]));
         /// Сглаживатели сбрасываются к текущей цели, чтобы configure() не вносил скачок.
-        band_smoothers_[band_index].reset(target_band_gains_db_[band_index]);
+        band_gain_smoothers_[band_index].reset(target_band_gains_db_[band_index]);
+        band_frequency_smoothers_[band_index].reset(target_band_frequencies_hz_[band_index]);
     }
 
     /// Остальные сглаживатели тоже синхронизируются с текущим состоянием.
@@ -80,19 +89,30 @@ void equalizer_chain::set_enabled(const bool enabled) {
     wet_mix_smoother_.set_target(enabled ? 1.0F : 0.0F, ramp_samples_for_rate(sample_rate_));
 }
 
-/// Обновляет желаемые значения усиления для всех EQ-полос.
-void equalizer_chain::set_band_gains(const std::array<float, equalizer_band_count>& band_gains_db) {
-    target_band_gains_db_ = band_gains_db;
+/// Обновляет желаемую раскладку полос EQ.
+void equalizer_chain::set_bands(const std::span<const equalizer_band> bands) {
     const std::size_t ramp_samples = ramp_samples_for_rate(sample_rate_);
+    active_band_count_ = (std::min)(bands.size(), static_cast<std::size_t>(equalizer_max_band_count));
+    const std::span<const equalizer_band> active_bands = bands.first(active_band_count_);
 
-    for (std::size_t band_index = 0; band_index < band_smoothers_.size(); ++band_index) {
+    for (std::size_t band_index = 0; band_index < active_band_count_; ++band_index) {
+        target_band_frequencies_hz_[band_index] = active_bands[band_index].center_frequency_hz;
+        target_band_gains_db_[band_index] = active_bands[band_index].gain_db;
         /// Каждая полоса движется к своей цели с одинаковой длиной перехода.
-        band_smoothers_[band_index].set_target(target_band_gains_db_[band_index], ramp_samples);
+        band_gain_smoothers_[band_index].set_target(target_band_gains_db_[band_index], ramp_samples);
+        band_frequency_smoothers_[band_index].set_target(
+            target_band_frequencies_hz_[band_index],
+            ramp_samples);
+    }
+    for (std::size_t band_index = active_band_count_; band_index < filters_.size(); ++band_index) {
+        target_band_gains_db_[band_index] = 0.0F;
+        band_gain_smoothers_[band_index].reset(0.0F);
+        band_frequency_smoothers_[band_index].reset(target_band_frequencies_hz_[band_index]);
     }
 
-    /// Компенсация запаса по уровню пересчитывается по полной целевой кривой.
     headroom_compensation_db_ =
-        headroom_controller_.compute_target_preamp_db(target_band_gains_db_, sample_rate_);
+        headroom_controller_.compute_target_preamp_db(active_bands, sample_rate_);
+
     preamp_smoother_.set_target(headroom_compensation_db_, ramp_samples);
 }
 
@@ -128,9 +148,9 @@ void equalizer_chain::process(float* interleaved_samples, const std::size_t fram
         float* processed_block = interleaved_samples + frame_offset * channel_count_;
         const float* dry_block = dry_copy.data() + frame_offset * channel_count_;
 
-        for (biquad_filter& filter : filters_) {
+        for (std::size_t band_index = 0; band_index < active_band_count_; ++band_index) {
             /// Все полосы проходят последовательно через один и тот же блок, поэтому кривая накапливается.
-            filter.process(processed_block, control_frames, channel_count_);
+            filters_[band_index].process(processed_block, control_frames, channel_count_);
         }
 
         /// Все связанные с усилением значения сглаживаются только один раз на контрольный блок.
@@ -151,9 +171,18 @@ void equalizer_chain::process(float* interleaved_samples, const std::size_t fram
     }
 }
 
-/// Возвращает текущие целевые значения полос в виде снимка.
-std::array<float, equalizer_band_count> equalizer_chain::target_band_gains_db() const {
-    return target_band_gains_db_;
+/// Возвращает текущую целевую раскладку полос в виде снимка.
+std::vector<equalizer_band> equalizer_chain::target_bands() const {
+    std::vector<equalizer_band> bands;
+    bands.reserve(active_band_count_);
+    for (std::size_t band_index = 0; band_index < active_band_count_; ++band_index) {
+        bands.push_back(equalizer_band{
+            .center_frequency_hz = target_band_frequencies_hz_[band_index],
+            .gain_db = target_band_gains_db_[band_index],
+        });
+    }
+
+    return bands;
 }
 
 /// Возвращает текущую оценку автоматического запаса по уровню.
@@ -176,25 +205,28 @@ std::size_t equalizer_chain::channel_count() const {
     return channel_count_;
 }
 
-    /// Возвращает пользовательское усиление после EQ.
+/// Возвращает пользовательское усиление после EQ.
 float equalizer_chain::output_gain_db() const {
     return output_gain_db_;
 }
 
-    /// Возвращает фиксированную раскладку полос, используемую этой реализацией EQ.
-const std::array<float, equalizer_band_count>& equalizer_chain::band_frequencies_hz() {
-    return kBandFrequenciesHz;
+/// Возвращает текущее число активных полос.
+std::size_t equalizer_chain::active_band_count() const {
+    return active_band_count_;
 }
 
 /// Продвигает сглаживатели коэффициентов и применяет новые коэффициенты ко всем полосам.
 void equalizer_chain::update_filter_coefficients(const std::size_t control_block_frames) {
-    for (std::size_t band_index = 0; band_index < filters_.size(); ++band_index) {
+    for (std::size_t band_index = 0; band_index < active_band_count_; ++band_index) {
         /// Текущее усиление полосы хранится отдельно, чтобы секция фильтра могла эволюционировать плавно.
-        current_band_gains_db_[band_index] = band_smoothers_[band_index].advance(control_block_frames);
+        current_band_gains_db_[band_index] =
+            band_gain_smoothers_[band_index].advance(control_block_frames);
+        current_band_frequencies_hz_[band_index] =
+            band_frequency_smoothers_[band_index].advance(control_block_frames);
         filters_[band_index].set_coefficients(
             make_peaking_coefficients(
                 sample_rate_,
-                kBandFrequenciesHz[band_index],
+                current_band_frequencies_hz_[band_index],
                 kEqualizerQ,
                 current_band_gains_db_[band_index]));
     }
