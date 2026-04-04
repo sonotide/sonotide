@@ -10,3 +10,13 @@ add_test(NAME sonotide_state_machine_tests COMMAND sonotide_state_machine_tests)
 add_executable(sonotide_equalizer_tests unit/equalizer_tests.cpp)
 target_link_libraries(sonotide_equalizer_tests PRIVATE Sonotide::sonotide)
 add_test(NAME sonotide_equalizer_tests COMMAND sonotide_equalizer_tests)
+
+add_executable(sonotide_dsp_tests unit/dsp_tests.cpp)
+target_link_libraries(sonotide_dsp_tests PRIVATE Sonotide::sonotide)
+target_include_directories(sonotide_dsp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME sonotide_dsp_tests COMMAND sonotide_dsp_tests)
+
+add_executable(sonotide_stream_wrapper_tests unit/stream_wrapper_tests.cpp)
+target_link_libraries(sonotide_stream_wrapper_tests PRIVATE Sonotide::sonotide)
+target_include_directories(sonotide_stream_wrapper_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME sonotide_stream_wrapper_tests COMMAND sonotide_stream_wrapper_tests)
