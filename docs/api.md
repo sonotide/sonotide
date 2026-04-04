@@ -140,6 +140,9 @@ public:
 - `set_equalizer_enabled(bool enabled)`
 - `select_equalizer_preset(equalizer_preset_id preset_id)`
 - `set_equalizer_band_gain(std::size_t band_index, float gain_db)`
+- `add_equalizer_band(float center_frequency_hz, float gain_db = 0.0F)`
+- `remove_equalizer_band(std::size_t band_index)`
+- `set_equalizer_band_frequency(std::size_t band_index, float center_frequency_hz)`
 - `reset_equalizer()`
 - `set_equalizer_output_gain(float output_gain_db)`
 - `apply_equalizer_state(const equalizer_state& state)`
@@ -147,6 +150,7 @@ public:
 - `select_output_device(std::string device_id)`
 - `state()`
 - `equalizer_state()`
+- `equalizer_band_frequency_range(std::size_t band_index) const`
 - `close()`
 
 Это удобный слой для приложения, которому нужно не только отправлять PCM в поток вывода, но и держать транспортное состояние, громкость, устройство вывода и встроенный EQ в одном месте.
@@ -169,6 +173,14 @@ session.set_volume_percent(80);
 session.select_equalizer_preset(sonotide::equalizer_preset_id::rock);
 session.play();
 ```
+
+Для более гибкого эквалайзера `playback_session` теперь позволяет:
+
+- держать от `0` до `10` полос;
+- добавлять и удалять полосы во время работы;
+- менять не только `gain_db`, но и `center_frequency_hz`;
+- брать готовые раскладки через `make_default_equalizer_bands(...)`;
+- запрашивать глобальные ограничения и допустимый диапазон перемещения конкретной полосы.
 
 ## Ошибки
 
