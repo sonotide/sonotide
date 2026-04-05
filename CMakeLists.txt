@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.24)
 
 # project(...) задаёт базовые свойства всего CMake-проекта:
 # - Sonotide: имя проекта; используется в сообщениях CMake и package metadata.
-# - VERSION 0.2.0: версия проекта; позже её можно переиспользовать в install/package файлах.
+# - VERSION 0.3.0: версия проекта; позже её можно переиспользовать в install/package файлах.
 # - LANGUAGES CXX: подключаем только язык C++, без C/RC/других языков.
-project(Sonotide VERSION 0.2.0 LANGUAGES CXX)
+project(Sonotide VERSION 0.3.0 LANGUAGES CXX)
 
 # include(...) подгружает встроенные модули CMake:
 # - CMakePackageConfigHelpers: helpers для генерации SonotideConfig.cmake и version-файла.
