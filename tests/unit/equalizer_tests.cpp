@@ -168,6 +168,43 @@ int main() {
     assert(active_curve_result.value().points[2].response_db <
         active_curve_result.value().points[1].response_db);
 
+    // Helper должен нормализовать временный layout так же, как это делает playback path:
+    // сортировать полосы, выдерживать минимальный зазор и clamp-ить q/gain.
+    sonotide::equalizer_state raw_state;
+    raw_state.enabled = true;
+    raw_state.output_gain_db = 1.5F;
+    raw_state.bands = {{
+        {.center_frequency_hz = 1005.0F, .gain_db = -3.0F, .q_value = 100.0F},
+        {.center_frequency_hz = 1000.0F, .gain_db = 6.0F, .q_value = 0.05F},
+    }};
+    sonotide::equalizer_state normalized_state;
+    normalized_state.enabled = true;
+    normalized_state.output_gain_db = 1.5F;
+    normalized_state.bands = {{
+        {.center_frequency_hz = 1000.0F, .gain_db = 6.0F, .q_value = 0.1F},
+        {.center_frequency_hz = 1010.0F, .gain_db = -3.0F, .q_value = 12.0F},
+    }};
+
+    const std::array<float, 3> normalized_frequencies_hz{{500.0F, 1000.0F, 4000.0F}};
+    auto raw_curve_result =
+        sonotide::sample_equalizer_response(raw_state, 48000.0F, normalized_frequencies_hz);
+    auto normalized_curve_result =
+        sonotide::sample_equalizer_response(normalized_state, 48000.0F, normalized_frequencies_hz);
+    assert(raw_curve_result);
+    assert(normalized_curve_result);
+    assert(std::fabs(
+        raw_curve_result.value().applied_headroom_compensation_db -
+        normalized_curve_result.value().applied_headroom_compensation_db) < kEpsilon);
+    assert(std::fabs(
+        raw_curve_result.value().applied_output_gain_db -
+        normalized_curve_result.value().applied_output_gain_db) < kEpsilon);
+    assert(raw_curve_result.value().points.size() == normalized_curve_result.value().points.size());
+    for (std::size_t index = 0; index < raw_curve_result.value().points.size(); ++index) {
+        assert(std::fabs(
+            raw_curve_result.value().points[index].response_db -
+            normalized_curve_result.value().points[index].response_db) < kEpsilon);
+    }
+
     // Текстовые токены должны оставаться стабильными для UI и сериализации.
     assert(
         sonotide::to_string(sonotide::equalizer_status::unsupported_audio_path) ==

@@ -43,6 +43,41 @@ bool approximately_equal(const float left, const float right, const float epsilo
     return std::fabs(left - right) <= epsilon;
 }
 
+bool equalizer_states_match(
+    const sonotide::equalizer_state& left,
+    const sonotide::equalizer_state& right,
+    const float epsilon = kEpsilon) {
+    if (left.status != right.status ||
+        left.enabled != right.enabled ||
+        left.active_preset_id != right.active_preset_id ||
+        left.bands.size() != right.bands.size() ||
+        left.last_nonflat_band_gains_db.size() != right.last_nonflat_band_gains_db.size() ||
+        !approximately_equal(left.output_gain_db, right.output_gain_db, epsilon) ||
+        !approximately_equal(left.headroom_compensation_db, right.headroom_compensation_db, epsilon) ||
+        left.error_message != right.error_message) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < left.bands.size(); ++index) {
+        if (!approximately_equal(left.bands[index].center_frequency_hz, right.bands[index].center_frequency_hz, epsilon) ||
+            !approximately_equal(left.bands[index].gain_db, right.bands[index].gain_db, epsilon) ||
+            !approximately_equal(left.bands[index].q_value, right.bands[index].q_value, epsilon)) {
+            return false;
+        }
+    }
+
+    for (std::size_t index = 0; index < left.last_nonflat_band_gains_db.size(); ++index) {
+        if (!approximately_equal(
+                left.last_nonflat_band_gains_db[index],
+                right.last_nonflat_band_gains_db[index],
+                epsilon)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 sonotide::error make_error(
     const sonotide::error_code code,
     std::string operation,
@@ -174,6 +209,15 @@ int main() {
     REQUIRE(!early_curve_result);
     REQUIRE(early_curve_result.error().code == sonotide::error_code::invalid_state);
 
+    sonotide::equalizer_preview_state early_preview_state;
+    early_preview_state.enabled = true;
+    early_preview_state.bands = {{
+        {.center_frequency_hz = 1000.0F, .gain_db = 3.0F, .q_value = 2.0F},
+    }};
+    auto early_preview_result = session.preview_equalizer_response(early_preview_state, frequencies_hz);
+    REQUIRE(!early_preview_result);
+    REQUIRE(early_preview_result.error().code == sonotide::error_code::invalid_state);
+
     // Invalid band index для нового Q API должен отклоняться.
     auto invalid_q_result = session.set_equalizer_band_q(99U, 2.0F);
     REQUIRE(!invalid_q_result);
@@ -199,6 +243,60 @@ int main() {
     REQUIRE(session_curve_result);
     REQUIRE(session_curve_result.value().enabled);
     REQUIRE(approximately_equal(session_curve_result.value().sample_rate_hz, 48000.0F));
+
+    const sonotide::equalizer_state live_state_before_preview = session.equalizer_state();
+
+    sonotide::equalizer_preview_state disabled_preview_state;
+    auto disabled_preview_result = session.preview_equalizer_response(disabled_preview_state, frequencies_hz);
+    REQUIRE(disabled_preview_result);
+    REQUIRE(!disabled_preview_result.value().enabled);
+    for (const auto& point : disabled_preview_result.value().points) {
+        REQUIRE(approximately_equal(point.response_db, 0.0F));
+    }
+
+    sonotide::equalizer_preview_state preview_state;
+    preview_state.enabled = true;
+    preview_state.output_gain_db = 3.0F;
+    preview_state.bands = {{
+        {.center_frequency_hz = 1005.0F, .gain_db = -3.0F, .q_value = 100.0F},
+        {.center_frequency_hz = 1000.0F, .gain_db = 6.0F, .q_value = 0.05F},
+    }};
+
+    auto preview_curve_result = session.preview_equalizer_response(preview_state, frequencies_hz);
+    REQUIRE(preview_curve_result);
+    REQUIRE(preview_curve_result.value().enabled);
+    REQUIRE(approximately_equal(preview_curve_result.value().sample_rate_hz, 48000.0F));
+    REQUIRE(approximately_equal(preview_curve_result.value().applied_output_gain_db, 3.0F));
+
+    sonotide::equalizer_state expected_preview_state;
+    expected_preview_state.enabled = true;
+    expected_preview_state.output_gain_db = 3.0F;
+    expected_preview_state.bands = {{
+        {.center_frequency_hz = 1000.0F, .gain_db = 6.0F, .q_value = 0.1F},
+        {.center_frequency_hz = 1010.0F, .gain_db = -3.0F, .q_value = 12.0F},
+    }};
+    const auto expected_preview_curve_result = sonotide::sample_equalizer_response(
+        expected_preview_state,
+        48000.0F,
+        frequencies_hz);
+    REQUIRE(expected_preview_curve_result);
+    REQUIRE(preview_curve_result.value().points.size() == expected_preview_curve_result.value().points.size());
+    REQUIRE(approximately_equal(
+        preview_curve_result.value().applied_headroom_compensation_db,
+        expected_preview_curve_result.value().applied_headroom_compensation_db,
+        0.05F));
+    for (std::size_t index = 0; index < preview_curve_result.value().points.size(); ++index) {
+        REQUIRE(approximately_equal(
+            preview_curve_result.value().points[index].frequency_hz,
+            expected_preview_curve_result.value().points[index].frequency_hz));
+        REQUIRE(approximately_equal(
+            preview_curve_result.value().points[index].response_db,
+            expected_preview_curve_result.value().points[index].response_db,
+            0.05F));
+    }
+
+    const sonotide::equalizer_state live_state_after_preview = session.equalizer_state();
+    REQUIRE(equalizer_states_match(live_state_before_preview, live_state_after_preview));
 
     const auto public_curve_result = sonotide::sample_equalizer_response(
         session.equalizer_state(),
