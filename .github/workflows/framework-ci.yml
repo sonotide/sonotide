@@ -6,9 +6,30 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: framework-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
+  build-test-package:
     runs-on: windows-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: Debug
+            preset: ci-ninja-debug
+            artifact_name: sonotide-sdk-debug
+            install_dir: build/install/ci-ninja-debug
+          - configuration: Release
+            preset: ci-ninja-release
+            artifact_name: sonotide-sdk-release
+            install_dir: build/install/ci-ninja-release
 
     steps:
       - name: Check out repository
@@ -20,10 +41,20 @@ jobs:
           arch: x64
 
       - name: Configure with CMake preset
-        run: cmake --preset ci-ninja-debug
+        run: cmake --preset ${{ matrix.preset }}
 
       - name: Build with CMake preset
-        run: cmake --build --preset ci-ninja-debug
+        run: cmake --build --preset ${{ matrix.preset }}
 
       - name: Run tests with CTest preset
-        run: ctest --preset ci-ninja-debug
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: Install package tree
+        run: cmake --install build/${{ matrix.preset }}
+
+      - name: Upload install tree artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.install_dir }}
+          if-no-files-found: error
