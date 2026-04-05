@@ -87,15 +87,15 @@ workspace-specific path in scripts or documentation.
 
 ## Releases
 
-Releases are published from git tags that match `v*`, for example `v0.1.0`.
+Releases are published from git tags that match `v*`, for example `v0.2.0`.
 A dedicated workflow builds the `Release` configuration, runs the tests,
 executes `cmake --install`, validates the installed package through a minimal
 consumer project, and automatically creates a GitHub Release with SDK assets
 like:
 
 ```text
-sonotide-0.1.0-windows-msvc-x64-release.zip
-sonotide-0.1.0-windows-msvc-x64-release.zip.sha256
+sonotide-0.2.0-windows-msvc-x64-release.zip
+sonotide-0.2.0-windows-msvc-x64-release.zip.sha256
 ```
 
 The archive contains the install tree. Users can unpack it and consume the SDK
