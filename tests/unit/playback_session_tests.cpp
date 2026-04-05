@@ -3,10 +3,11 @@
 #include "sonotide/runtime.h"
 #undef private
 
-#include <cassert>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <span>
 #include <string>
@@ -25,6 +26,18 @@ runtime::runtime(std::shared_ptr<detail::runtime_backend> backend) noexcept
 namespace {
 
 constexpr float kEpsilon = 0.01F;
+
+[[noreturn]] void fail_check(const char* expression, const char* file, const int line) {
+    std::cerr << file << ':' << line << ": check failed: " << expression << '\n';
+    std::abort();
+}
+
+#define REQUIRE(condition) \
+    do { \
+        if (!(condition)) { \
+            fail_check(#condition, __FILE__, __LINE__); \
+        } \
+    } while (false)
 
 bool approximately_equal(const float left, const float right, const float epsilon = kEpsilon) {
     return std::fabs(left - right) <= epsilon;
@@ -151,25 +164,25 @@ int main() {
     sonotide::runtime runtime(backend);
 
     auto session_result = runtime.open_playback_session({});
-    assert(session_result);
+    REQUIRE(session_result);
     auto session = std::move(session_result.value());
 
     const std::array<float, 3> frequencies_hz{{120.0F, 1000.0F, 8000.0F}};
 
     // Пока sample rate не известна, session-level sampling должен корректно отказываться.
     auto early_curve_result = session.sample_equalizer_response(frequencies_hz);
-    assert(!early_curve_result);
-    assert(early_curve_result.error().code == sonotide::error_code::invalid_state);
+    REQUIRE(!early_curve_result);
+    REQUIRE(early_curve_result.error().code == sonotide::error_code::invalid_state);
 
     // Invalid band index для нового Q API должен отклоняться.
     auto invalid_q_result = session.set_equalizer_band_q(99U, 2.0F);
-    assert(!invalid_q_result);
-    assert(invalid_q_result.error().code == sonotide::error_code::invalid_argument);
+    REQUIRE(!invalid_q_result);
+    REQUIRE(invalid_q_result.error().code == sonotide::error_code::invalid_argument);
 
-    assert(session.set_equalizer_enabled(true));
-    assert(session.set_equalizer_band_gain(4U, 6.0F));
-    assert(session.set_equalizer_band_q(4U, 4.0F));
-    assert(session.set_equalizer_output_gain(1.5F));
+    REQUIRE(session.set_equalizer_enabled(true));
+    REQUIRE(session.set_equalizer_band_gain(4U, 6.0F));
+    REQUIRE(session.set_equalizer_band_q(4U, 4.0F));
+    REQUIRE(session.set_equalizer_output_gain(1.5F));
 
     const sonotide::audio_format render_format{
         .sample = sonotide::sample_type::float32,
@@ -180,24 +193,24 @@ int main() {
         .channel_mask = 0,
         .interleaved = true,
     };
-    assert(backend->emit_render(render_format, 32U));
+    REQUIRE(backend->emit_render(render_format, 32U));
 
     auto session_curve_result = session.sample_equalizer_response(frequencies_hz);
-    assert(session_curve_result);
-    assert(session_curve_result.value().enabled);
-    assert(approximately_equal(session_curve_result.value().sample_rate_hz, 48000.0F));
+    REQUIRE(session_curve_result);
+    REQUIRE(session_curve_result.value().enabled);
+    REQUIRE(approximately_equal(session_curve_result.value().sample_rate_hz, 48000.0F));
 
     const auto public_curve_result = sonotide::sample_equalizer_response(
         session.equalizer_state(),
         48000.0F,
         frequencies_hz);
-    assert(public_curve_result);
-    assert(session_curve_result.value().points.size() == public_curve_result.value().points.size());
+    REQUIRE(public_curve_result);
+    REQUIRE(session_curve_result.value().points.size() == public_curve_result.value().points.size());
     for (std::size_t index = 0; index < session_curve_result.value().points.size(); ++index) {
-        assert(approximately_equal(
+        REQUIRE(approximately_equal(
             session_curve_result.value().points[index].frequency_hz,
             public_curve_result.value().points[index].frequency_hz));
-        assert(approximately_equal(
+        REQUIRE(approximately_equal(
             session_curve_result.value().points[index].response_db,
             public_curve_result.value().points[index].response_db,
             0.05F));
