@@ -153,5 +153,4 @@ transport state without tying that logic to any specific application.
 - the backend should stay close to the real WASAPI model instead of hiding it completely;
 - the playback layer should not absorb application-specific domain logic.
 
-More detail is available in [docs/foundation.md](docs/foundation.md),
-[docs/architecture.md](docs/architecture.md), and [docs/api.md](docs/api.md).
+More detail is available in [docs](https://sonotide.mintlify.app/en).
