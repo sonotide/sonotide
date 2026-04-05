@@ -24,6 +24,23 @@
       }
     },
     {
+      "name": "msvc-x64-release",
+      "displayName": "MSVC x64 Release",
+      "description": "Configure Sonotide with Visual Studio 2026 for x64 Release builds.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/msvc-x64-release",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/msvc-x64-release",
+        "SONOTIDE_BUILD_EXAMPLES": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SONOTIDE_BUILD_TESTS": "ON"
+      }
+    },
+    {
       "name": "ci-ninja-debug",
       "displayName": "CI Ninja Debug",
       "description": "Configure Sonotide for CI with Ninja and a single-config Debug build.",
@@ -32,6 +49,20 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/ci-ninja-debug",
+        "SONOTIDE_BUILD_EXAMPLES": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SONOTIDE_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "ci-ninja-release",
+      "displayName": "CI Ninja Release",
+      "description": "Configure Sonotide for CI with Ninja and a single-config Release build.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ci-ninja-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/ci-ninja-release",
         "SONOTIDE_BUILD_EXAMPLES": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "SONOTIDE_BUILD_TESTS": "ON"
@@ -47,10 +78,23 @@
       "configuration": "Debug"
     },
     {
+      "name": "msvc-x64-release",
+      "displayName": "Build MSVC x64 Release",
+      "description": "Build Sonotide with the MSVC x64 Release configure preset.",
+      "configurePreset": "msvc-x64-release",
+      "configuration": "Release"
+    },
+    {
       "name": "ci-ninja-debug",
       "displayName": "Build CI Ninja Debug",
       "description": "Build Sonotide with the CI Ninja Debug configure preset.",
       "configurePreset": "ci-ninja-debug"
+    },
+    {
+      "name": "ci-ninja-release",
+      "displayName": "Build CI Ninja Release",
+      "description": "Build Sonotide with the CI Ninja Release configure preset.",
+      "configurePreset": "ci-ninja-release"
     }
   ],
   "testPresets": [
@@ -65,10 +109,29 @@
       }
     },
     {
+      "name": "msvc-x64-release",
+      "displayName": "Test MSVC x64 Release",
+      "description": "Run Sonotide tests from the MSVC x64 Release build tree.",
+      "configurePreset": "msvc-x64-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "ci-ninja-debug",
       "displayName": "Test CI Ninja Debug",
       "description": "Run Sonotide tests from the CI Ninja Debug build tree.",
       "configurePreset": "ci-ninja-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-ninja-release",
+      "displayName": "Test CI Ninja Release",
+      "description": "Run Sonotide tests from the CI Ninja Release build tree.",
+      "configurePreset": "ci-ninja-release",
       "output": {
         "outputOnFailure": true
       }
