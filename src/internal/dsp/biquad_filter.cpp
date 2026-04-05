@@ -79,6 +79,7 @@ biquad_coefficients make_peaking_coefficients(
         (std::clamp)(center_frequency_hz, 10.0F, max_supported_frequency_hz);
     /// Стандартная формула peaking EQ хорошо работает для фиксированной раскладки полос Sonotide.
     const float a = std::pow(10.0F, gain_db / 40.0F);
+    // TODO: разобрать формулы
     const float omega = 2.0F * kPi * (safe_center_frequency_hz / sample_rate);
     const float sin_omega = std::sin(omega);
     const float cos_omega = std::cos(omega);
