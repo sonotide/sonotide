@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
@@ -39,7 +40,7 @@ jobs:
           $tagVersion = $Matches[1]
 
           $cmakeText = Get-Content CMakeLists.txt -Raw
-          if ($cmakeText -notmatch 'project\(Sonotide VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
+          if ($cmakeText -notmatch 'project\s*\(\s*Sonotide\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
             throw "Failed to read project version from CMakeLists.txt."
           }
           $cmakeVersion = $Matches[1]
@@ -50,6 +51,19 @@ jobs:
           }
           $headerVersion = $Matches[1]
 
+          $versionParts = $headerVersion.Split('.')
+          $constantNames = @('version_major', 'version_minor', 'version_patch')
+          for ($index = 0; $index -lt $constantNames.Count; $index++) {
+            $constantName = $constantNames[$index]
+            $pattern = [regex]::Escape($constantName) + '\s*=\s*([0-9]+)'
+            if ($versionHeader -notmatch $pattern) {
+              throw "Failed to read $constantName from include/sonotide/version.h."
+            }
+            if ([int]$Matches[1] -ne [int]$versionParts[$index]) {
+              throw "$constantName '$($Matches[1])' does not match version_string '$headerVersion'."
+            }
+          }
+
           if ($tagVersion -ne $cmakeVersion) {
             throw "Tag version '$tagVersion' does not match CMake version '$cmakeVersion'."
           }
@@ -57,7 +71,32 @@ jobs:
             throw "Tag version '$tagVersion' does not match header version '$headerVersion'."
           }
 
+          $changelogText = Get-Content CHANGELOG.md -Raw
+          $changelogHeading = '(?m)^## \[' + [regex]::Escape($tagVersion) + '\](?:\s|$)'
+          if ($changelogText -notmatch $changelogHeading) {
+            throw "CHANGELOG.md does not contain a release section for '$tagVersion'."
+          }
+
           "version=$tagVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Enforce immutable published releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}"
+          $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
+          if ($response.StatusCode -eq 200) {
+            throw "Release '${{ github.ref_name }}' already exists. Published release tags and assets are immutable; publish a new patch version instead."
+          }
+          if ($response.StatusCode -ne 404) {
+            throw "Failed to check release immutability: GitHub API returned HTTP $($response.StatusCode)."
+          }
 
       - name: Configure release build
         run: cmake --preset ci-ninja-release
@@ -97,9 +136,42 @@ jobs:
 
           New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
           Copy-Item -Path "build/install/ci-ninja-release/*" -Destination $packageRoot -Recurse
+
+          $manifestPath = Join-Path $packageRoot "SHA256SUMS.txt"
+          $manifestLines = Get-ChildItem -LiteralPath $packageRoot -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relativePath = $_.FullName.Substring($packageRoot.Length).TrimStart('\', '/').Replace('\', '/')
+              $fileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$fileHash  $relativePath"
+            }
+          Set-Content -LiteralPath $manifestPath -Value $manifestLines -Encoding ascii
+
           Compress-Archive -Path $packageRoot -DestinationPath $zipPath -Force
           Expand-Archive -Path $zipPath -DestinationPath $verificationRoot
           Move-Item -LiteralPath "build/install/ci-ninja-release" -Destination "build/original-install-tree"
+
+          $extractedRoot = Join-Path $verificationRoot $assetBaseName
+          $extractedManifest = Join-Path $extractedRoot "SHA256SUMS.txt"
+          foreach ($line in Get-Content -LiteralPath $extractedManifest) {
+            if ($line -notmatch '^([0-9a-f]{64})  (.+)$') {
+              throw "Invalid package manifest entry: '$line'."
+            }
+            $expectedHash = $Matches[1]
+            $relativePath = $Matches[2]
+            $candidate = [System.IO.Path]::GetFullPath((Join-Path $extractedRoot $relativePath))
+            $rootWithSeparator = [System.IO.Path]::GetFullPath($extractedRoot).TrimEnd('\') + '\'
+            if (-not $candidate.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw "Package manifest path escapes the archive root: '$relativePath'."
+            }
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              throw "Package manifest references a missing file: '$relativePath'."
+            }
+            $actualHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash.ToLower()
+            if ($actualHash -ne $expectedHash) {
+              throw "Package manifest hash mismatch for '$relativePath'."
+            }
+          }
 
           $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path $checksumPath -Value "$hash  $assetBaseName.zip"
@@ -116,6 +188,7 @@ jobs:
           -B build/smoke-consumer
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
+          -DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}
           -DCMAKE_PREFIX_PATH=${{ steps.package.outputs.verification_prefix }}
 
       - name: Build smoke consumer
@@ -130,6 +203,8 @@ jobs:
           name: Sonotide v${{ steps.version.outputs.version }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
           files: |
             ${{ steps.package.outputs.asset_path }}
             ${{ steps.package.outputs.checksum_path }}

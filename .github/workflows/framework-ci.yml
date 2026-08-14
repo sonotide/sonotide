@@ -34,6 +34,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up MSVC developer command prompt
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
@@ -42,6 +44,16 @@ jobs:
 
       - name: Configure with CMake preset
         run: cmake --preset ${{ matrix.preset }}
+
+      - name: Read configured project version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath "build/${{ matrix.preset }}/SonotideVersion.txt" -Raw).Trim()
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Configured Sonotide version '$version' is invalid."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Build with CMake preset
         run: cmake --build --preset ${{ matrix.preset }}
@@ -64,6 +76,7 @@ jobs:
           -B build/smoke-consumer-${{ matrix.preset }}
           -G Ninja
           -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+          -DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}
           -DCMAKE_PREFIX_PATH=${{ github.workspace }}/build/relocated-${{ matrix.preset }}
 
       - name: Build smoke consumer
@@ -78,3 +91,27 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: build/relocated-${{ matrix.preset }}
           if-no-files-found: error
+
+  address-sanitizer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Configure with AddressSanitizer
+        run: cmake --preset ci-ninja-asan
+
+      - name: Build with AddressSanitizer
+        run: cmake --build --preset ci-ninja-asan
+
+      - name: Run tests with AddressSanitizer
+        run: ctest --preset ci-ninja-asan
