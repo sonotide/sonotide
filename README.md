@@ -206,6 +206,13 @@ release or same-named assets.
 Notable changes are recorded in [`CHANGELOG.md`](CHANGELOG.md). Security issues
 should be reported privately according to [`SECURITY.md`](SECURITY.md).
 
+## License
+
+Sonotide is available under the permissive [MIT License](LICENSE). You may use,
+modify, distribute, and include it in commercial or closed-source applications,
+provided that the copyright and license notice remain with copies or substantial
+portions of the software.
+
 ## Design principles
 
 - keep raw COM and Windows implementation types out of public headers;

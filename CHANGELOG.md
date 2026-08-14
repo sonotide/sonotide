@@ -19,6 +19,8 @@ minor release may contain API or ABI changes.
 - Reworked the README around installation, lifecycle rules, compatibility, and
   current pre-1.0 limitations.
 - Added this changelog and a private vulnerability-reporting policy.
+- Licensed Sonotide under the permissive MIT License and included the license
+  notice in every installed SDK and release archive.
 
 ## [0.4.0] - 2026-08-14
 

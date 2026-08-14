@@ -17,6 +17,19 @@ if(NOT TARGET Sonotide::sonotide)
     message(FATAL_ERROR "Sonotide package did not define Sonotide::sonotide")
 endif()
 
+get_filename_component(SONOTIDE_PACKAGE_PREFIX "${Sonotide_DIR}/../../.." ABSOLUTE)
+set(SONOTIDE_INSTALLED_LICENSE
+    "${SONOTIDE_PACKAGE_PREFIX}/share/doc/Sonotide/LICENSE")
+if(NOT EXISTS "${SONOTIDE_INSTALLED_LICENSE}")
+    message(FATAL_ERROR
+        "Sonotide package does not contain its required LICENSE file: ${SONOTIDE_INSTALLED_LICENSE}")
+endif()
+file(READ "${SONOTIDE_INSTALLED_LICENSE}" SONOTIDE_LICENSE_TEXT)
+if(NOT SONOTIDE_LICENSE_TEXT MATCHES
+        "^MIT License[\r\n]+[\r\n]+Copyright \\(c\\) 2026 Gleb Kovsharov")
+    message(FATAL_ERROR "Sonotide package contains an unexpected license notice")
+endif()
+
 add_executable(sonotide_smoke_consumer main.cpp)
 target_link_libraries(sonotide_smoke_consumer PRIVATE Sonotide::sonotide)
 target_compile_features(sonotide_smoke_consumer PRIVATE cxx_std_20)

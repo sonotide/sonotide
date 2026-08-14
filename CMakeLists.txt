@@ -286,14 +286,13 @@ install(
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/Sonotide
 )
 
-# The license is intentionally selected by the repository owner. Once present,
-# always ship it with every installed SDK and release archive.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-    install(
-        FILES LICENSE
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/Sonotide
-    )
-endif()
+# The license is a required part of every installed SDK and release archive.
+# Keeping this install rule unconditional makes a missing source LICENSE fail
+# packaging instead of silently producing an unusable public artifact.
+install(
+    FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/Sonotide
+)
 
 install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/SonotideVersion.txt
