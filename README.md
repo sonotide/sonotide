@@ -156,3 +156,24 @@ transport state without tying that logic to any specific application.
 - the playback layer should not absorb application-specific domain logic.
 
 More detail is available in [docs](https://sonotide.mintlify.app/en).
+
+## Device-loss policy
+
+Low-level render, capture, and loopback streams report endpoint invalidation through
+`on_stream_error`, set `stream_status::device_lost`, and enter the `faulted` state. The
+`auto_recover_device_loss` configuration member is a policy hint for the stream owner
+or the higher-level playback layer; low-level streams do not automatically rebind to a
+replacement endpoint. Applications that use low-level streams should close/reopen the
+stream after receiving a device-loss notification.
+
+Stream callbacks are borrowed rather than owned by the framework. A callback object must remain
+alive until `close()` succeeds on a thread outside the callback. Calling `stop()` or `close()`
+from the audio callback requests shutdown but returns `invalid_state`, because that thread cannot
+synchronously wait for its own callback to return; retry from another thread before destroying
+the callback. The callback and its stream wrapper must not be destroyed from inside the callback.
+Callback exceptions are contained by the backend and reported as a fault instead of escaping the
+audio worker thread.
+
+`playback_session::close()` is synchronous: it waits for the decoder worker and can therefore
+wait for an in-flight Media Foundation or file-system operation to return. Applications should
+call it from a control thread, not from a UI or audio callback.
