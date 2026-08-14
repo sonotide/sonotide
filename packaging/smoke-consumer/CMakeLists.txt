@@ -5,6 +5,10 @@ project(SonotideSmokeConsumer LANGUAGES CXX)
 if(NOT DEFINED SONOTIDE_EXPECTED_VERSION OR SONOTIDE_EXPECTED_VERSION STREQUAL "")
     message(FATAL_ERROR "SONOTIDE_EXPECTED_VERSION must be provided by package verification")
 endif()
+if(NOT SONOTIDE_EXPECTED_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR
+        "SONOTIDE_EXPECTED_VERSION must be an exact MAJOR.MINOR.PATCH value, got '${SONOTIDE_EXPECTED_VERSION}'")
+endif()
 
 find_package(Sonotide ${SONOTIDE_EXPECTED_VERSION} EXACT CONFIG REQUIRED)
 

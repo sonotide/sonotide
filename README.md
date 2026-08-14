@@ -50,7 +50,7 @@ be mixed.
 3. Extract the archive and point CMake at its root:
 
    ```powershell
-   cmake -S . -B build -DCMAKE_PREFIX_PATH=C:\sdk\sonotide-0.4.1-windows-msvc-x64-release
+   cmake -S . -B build "-DCMAKE_PREFIX_PATH=C:\sdk\sonotide-0.4.1-windows-msvc-x64-release"
    cmake --build build --config Release
    ```
 

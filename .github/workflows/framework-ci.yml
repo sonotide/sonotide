@@ -76,8 +76,8 @@ jobs:
           -B build/smoke-consumer-${{ matrix.preset }}
           -G Ninja
           -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
-          -DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}
-          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/build/relocated-${{ matrix.preset }}
+          "-DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}"
+          "-DCMAKE_PREFIX_PATH=${{ github.workspace }}/build/relocated-${{ matrix.preset }}"
 
       - name: Build smoke consumer
         run: cmake --build build/smoke-consumer-${{ matrix.preset }}

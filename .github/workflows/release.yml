@@ -188,8 +188,8 @@ jobs:
           -B build/smoke-consumer
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}
-          -DCMAKE_PREFIX_PATH=${{ steps.package.outputs.verification_prefix }}
+          "-DSONOTIDE_EXPECTED_VERSION=${{ steps.version.outputs.version }}"
+          "-DCMAKE_PREFIX_PATH=${{ steps.package.outputs.verification_prefix }}"
 
       - name: Build smoke consumer
         run: cmake --build build/smoke-consumer
