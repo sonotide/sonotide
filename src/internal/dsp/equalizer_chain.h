@@ -18,12 +18,16 @@ class equalizer_chain {
 public:
     /// Подготавливает цепочку для конкретной частоты дискретизации и раскладки каналов.
     void configure(float sample_rate, std::size_t channel_count);
+    /// Резервирует scratch-буфер для максимального размера render callback вне hot path.
+    void prepare(std::size_t max_frame_count);
     /// Сбрасывает внутреннюю память фильтров.
     void reset();
     /// Включает или выключает обработанный путь EQ с коротким переходом.
     void set_enabled(bool enabled);
     /// Применяет текущую раскладку полос и их gain/frequency-значения за один вызов.
     void set_bands(std::span<const equalizer_band> bands);
+    /// Применяет полосы с заранее вычисленной вне realtime-path компенсацией headroom.
+    void set_bands_precomputed(std::span<const equalizer_band> bands, float headroom_compensation_db);
     /// Устанавливает выходное усиление после EQ в децибелах.
     void set_output_gain_db(float output_gain_db);
     /// Устанавливает линейный множитель громкости воспроизведения перед финальным ограничением.
@@ -90,6 +94,8 @@ private:
     bool enabled_ = false;
     /// Текущее число активных полос.
     std::size_t active_band_count_ = 0;
+    /// Переиспользуемая копия dry-сигнала; ёмкость увеличивается только в `prepare`.
+    std::vector<float> dry_scratch_;
 };
 
 /// Возвращает встроенные пресеты эквалайзера, используемые Sonotide.

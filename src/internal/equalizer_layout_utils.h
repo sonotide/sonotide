@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <span>
 #include <vector>
 
@@ -22,13 +23,20 @@ inline std::vector<equalizer_band> normalize_equalizer_bands(
             break;
         }
 
+        const float finite_frequency_hz = std::isfinite(band.center_frequency_hz)
+            ? band.center_frequency_hz
+            : frequency_limits.min_frequency_hz;
+        const float finite_gain_db = std::isfinite(band.gain_db) ? band.gain_db : 0.0F;
+        const float finite_q_value = std::isfinite(band.q_value)
+            ? band.q_value
+            : default_equalizer_q_value;
         normalized_bands.push_back(equalizer_band{
             .center_frequency_hz = (std::clamp)(
-                band.center_frequency_hz,
+                finite_frequency_hz,
                 frequency_limits.min_frequency_hz,
                 frequency_limits.max_frequency_hz),
-            .gain_db = (std::clamp)(band.gain_db, -12.0F, 12.0F),
-            .q_value = (std::clamp)(band.q_value, q_limits.min_q_value, q_limits.max_q_value),
+            .gain_db = (std::clamp)(finite_gain_db, -12.0F, 12.0F),
+            .q_value = (std::clamp)(finite_q_value, q_limits.min_q_value, q_limits.max_q_value),
         });
     }
 

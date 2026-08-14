@@ -68,18 +68,27 @@ biquad_coefficients make_peaking_coefficients(
     const float center_frequency_hz,
     const float q_value,
     const float gain_db) {
-    if (sample_rate <= 0.0F || center_frequency_hz <= 0.0F || q_value <= 0.0F) {
+    if (!std::isfinite(sample_rate) || !std::isfinite(center_frequency_hz) ||
+        !std::isfinite(q_value) || !std::isfinite(gain_db) ||
+        sample_rate <= 0.0F || center_frequency_hz <= 0.0F || q_value <= 0.0F) {
         /// Некорректные входные параметры откатываются к нейтральной секции без обработки.
         return {};
     }
 
     /// Верхние полосы должны оставаться ниже частоты Найквиста, иначе фильтр становится численно хрупким.
     const float max_supported_frequency_hz = (sample_rate * 0.5F) * 0.9F;
+    if (max_supported_frequency_hz < 10.0F) {
+        // Avoid violating std::clamp's ordered-bound precondition for unusual
+        // but finite low sample rates. Such a rate cannot represent a useful
+        // peaking band, so the safe response is an identity section.
+        return {};
+    }
     const float safe_center_frequency_hz =
         (std::clamp)(center_frequency_hz, 10.0F, max_supported_frequency_hz);
     /// Стандартная формула peaking EQ хорошо работает для фиксированной раскладки полос Sonotide.
     const float a = std::pow(10.0F, gain_db / 40.0F);
-    // TODO: разобрать формулы
+    // RBJ audio-EQ cookbook form: A maps dB gain to amplitude and alpha
+    // controls the bandwidth through Q before the section is normalized by a0.
     const float omega = 2.0F * kPi * (safe_center_frequency_hz / sample_rate);
     const float sin_omega = std::sin(omega);
     const float cos_omega = std::cos(omega);
@@ -91,6 +100,12 @@ biquad_coefficients make_peaking_coefficients(
     const float a0 = 1.0F + alpha / a;
     const float a1 = -2.0F * cos_omega;
     const float a2 = 1.0F - alpha / a;
+
+    if (!std::isfinite(a0) || a0 == 0.0F ||
+        !std::isfinite(b0) || !std::isfinite(b1) || !std::isfinite(b2) ||
+        !std::isfinite(a1) || !std::isfinite(a2)) {
+        return {};
+    }
 
     return biquad_coefficients{
         .b0 = b0 / a0,

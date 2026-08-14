@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -101,6 +102,8 @@ public:
     [[nodiscard]] std::optional<equalizer_frequency_range> equalizer_band_frequency_range(
         std::size_t band_index) const;
     /// Закрывает сессию и освобождает runtime resources.
+    /// Вызов синхронный и может ждать уже начатую операцию Media Foundation
+    /// или файловой системы для текущего источника.
     result<void> close();
 
 private:
@@ -108,14 +111,14 @@ private:
     class implementation;
 
     /// Приватный конструктор, используемый фабричными методами runtime.
-    explicit playback_session(std::unique_ptr<implementation> implementation) noexcept;
+    explicit playback_session(std::shared_ptr<implementation> implementation) noexcept;
     /// Внутренняя фабрика, используемая runtime.
     static result<playback_session> create(
         std::shared_ptr<detail::runtime_backend> backend,
         const playback_session_config& config);
 
     /// Указатель на реализацию, которая владеет полным состоянием сессии.
-    std::unique_ptr<implementation> implementation_;
+    std::atomic<std::shared_ptr<implementation>> implementation_;
 
     /// Runtime разрешено создавать сессии напрямую.
     friend class runtime;

@@ -4,17 +4,26 @@
 #undef private
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
-#include <cstdlib>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <limits>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "internal/runtime_backend.h"
+#include "internal/playback/decoded_audio_queue.h"
+#include "internal/playback/playback_decoder.h"
+#include "test_support/test_harness.h"
 
 namespace sonotide {
 
@@ -26,18 +35,6 @@ runtime::runtime(std::shared_ptr<detail::runtime_backend> backend) noexcept
 namespace {
 
 constexpr float kEpsilon = 0.01F;
-
-[[noreturn]] void fail_check(const char* expression, const char* file, const int line) {
-    std::cerr << file << ':' << line << ": check failed: " << expression << '\n';
-    std::abort();
-}
-
-#define REQUIRE(condition) \
-    do { \
-        if (!(condition)) { \
-            fail_check(#condition, __FILE__, __LINE__); \
-        } \
-    } while (false)
 
 bool approximately_equal(const float left, const float right, const float epsilon = kEpsilon) {
     return std::fabs(left - right) <= epsilon;
@@ -110,6 +107,7 @@ public:
     sonotide::result<void> close() override {
         started_ = false;
         closed_ = true;
+        close_count_.fetch_add(1U);
         return sonotide::result<void>::success();
     }
 
@@ -121,9 +119,14 @@ public:
         return snapshot;
     }
 
+    [[nodiscard]] std::size_t close_count() const noexcept {
+        return close_count_.load();
+    }
+
 private:
     bool started_ = false;
     bool closed_ = false;
+    std::atomic<std::size_t> close_count_{0U};
 };
 
 class fake_runtime_backend final : public sonotide::detail::runtime_backend {
@@ -133,6 +136,12 @@ public:
 
     [[nodiscard]] sonotide::result<std::vector<sonotide::device_info>> enumerate_devices(
         sonotide::device_direction) const override {
+        std::unique_lock lock(enumerate_mutex_);
+        if (block_enumerate_) {
+            enumerate_entered_ = true;
+            enumerate_condition_.notify_all();
+            enumerate_condition_.wait(lock, [this]() { return !block_enumerate_; });
+        }
         return sonotide::result<std::vector<sonotide::device_info>>::success({});
     }
 
@@ -148,6 +157,7 @@ public:
     [[nodiscard]] sonotide::result<std::shared_ptr<sonotide::detail::stream_handle>> open_render_stream(
         const sonotide::render_stream_config&,
         sonotide::render_callback& callback) override {
+        ++open_render_count_;
         render_callback_ = &callback;
         return sonotide::result<std::shared_ptr<sonotide::detail::stream_handle>>::success(handle_);
     }
@@ -182,14 +192,247 @@ public:
             static_cast<std::size_t>(frame_count) *
             static_cast<std::size_t>(format.channel_count) *
             sizeof(float));
-        return render_callback_->on_render(
+        auto render_result = render_callback_->on_render(
             sonotide::audio_buffer_view{bytes, frame_count, format},
             sonotide::stream_timestamp{});
+        {
+            std::scoped_lock lock(render_mutex_);
+            last_render_bytes_ = std::move(bytes);
+            ++render_count_;
+        }
+        render_condition_.notify_all();
+        return render_result;
+    }
+
+    [[nodiscard]] std::shared_ptr<fake_stream_handle> handle() const {
+        return handle_;
+    }
+    [[nodiscard]] std::size_t open_render_count() const noexcept { return open_render_count_.load(); }
+
+    void block_enumeration() {
+        std::scoped_lock lock(enumerate_mutex_);
+        block_enumerate_ = true;
+        enumerate_entered_ = false;
+    }
+
+    bool wait_for_enumeration() const {
+        std::unique_lock lock(enumerate_mutex_);
+        return enumerate_condition_.wait_for(
+            lock, std::chrono::seconds(5), [this]() { return enumerate_entered_; });
+    }
+
+    void release_enumeration() {
+        {
+            std::scoped_lock lock(enumerate_mutex_);
+            block_enumerate_ = false;
+        }
+        enumerate_condition_.notify_all();
+    }
+
+    [[nodiscard]] std::vector<std::byte> last_render_bytes() const {
+        std::scoped_lock lock(render_mutex_);
+        return last_render_bytes_;
     }
 
 private:
     std::shared_ptr<fake_stream_handle> handle_;
     sonotide::render_callback* render_callback_ = nullptr;
+    mutable std::mutex enumerate_mutex_;
+    mutable std::condition_variable enumerate_condition_;
+    mutable bool block_enumerate_ = false;
+    mutable bool enumerate_entered_ = false;
+    mutable std::mutex render_mutex_;
+    mutable std::condition_variable render_condition_;
+    std::vector<std::byte> last_render_bytes_;
+    std::size_t render_count_ = 0;
+    std::atomic<std::size_t> open_render_count_{0U};
+};
+
+struct controlled_decoder_state {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool block_open = false;
+    bool open_entered = false;
+    bool block_read = false;
+    bool read_entered = false;
+    bool fail_reads = false;
+    bool fail_open = false;
+    bool fail_seek = false;
+    bool next_eos = false;
+    std::string active_uri;
+    std::vector<std::string> opened_uris;
+    std::vector<std::string> read_uris;
+    std::vector<std::int64_t> seeks;
+    std::size_t read_count = 0;
+    std::size_t completed_read_count = 0;
+    std::size_t reads_after_seek = 0;
+    std::size_t cancel_count = 0;
+    std::uint64_t cancel_epoch = 0;
+
+    bool wait_for_open_count(const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return opened_uris.size() >= count; });
+    }
+    bool wait_for_read() {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return read_entered; });
+    }
+    bool wait_for_completed_reads(const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return completed_read_count >= count; });
+    }
+    bool wait_for_read_count(const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return read_count >= count; });
+    }
+    bool wait_for_seek_count(const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return seeks.size() >= count; });
+    }
+    bool wait_for_reads_after_seek(const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() { return reads_after_seek >= count; });
+    }
+    bool wait_for_uri_read_count(const std::string& uri, const std::size_t count) {
+        std::unique_lock lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return static_cast<std::size_t>(std::count(read_uris.begin(), read_uris.end(), uri)) >= count;
+        });
+    }
+    void release_open() {
+        {
+            std::scoped_lock lock(mutex);
+            block_open = false;
+        }
+        condition.notify_all();
+    }
+};
+
+class controlled_decoder final : public sonotide::detail::playback::decoder {
+public:
+    explicit controlled_decoder(std::shared_ptr<controlled_decoder_state> state)
+        : state_(std::move(state)) {}
+
+    sonotide::result<void> open(
+        const std::string& uri,
+        const sonotide::audio_format&,
+        const std::uint64_t operation_epoch) override {
+        std::unique_lock lock(state_->mutex);
+        if (state_->cancel_epoch != operation_epoch) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::invalid_state, "controlled_decoder::open", "cancelled"));
+        }
+        state_->active_uri = uri;
+        if (uri == "track-b") {
+            state_->next_eos = false;
+        }
+        state_->opened_uris.push_back(uri);
+        state_->open_entered = true;
+        state_->condition.notify_all();
+        if (!state_->condition.wait_for(
+                lock, std::chrono::seconds(5), [&]() {
+                    return !state_->block_open || state_->cancel_epoch != operation_epoch;
+                })) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::invalid_state, "controlled_decoder::open", "test timeout"));
+        }
+        if (state_->cancel_epoch != operation_epoch) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::invalid_state, "controlled_decoder::open", "cancelled"));
+        }
+        if (state_->fail_open) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::stream_open_failed,
+                "controlled_decoder::open",
+                "forced open failure"));
+        }
+        return sonotide::result<void>::success();
+    }
+
+    sonotide::result<void> seek_to(
+        const std::int64_t position_ms,
+        const std::uint64_t operation_epoch) override {
+        std::scoped_lock lock(state_->mutex);
+        if (state_->cancel_epoch != operation_epoch) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::invalid_state,
+                "controlled_decoder::seek_to",
+                "cancelled"));
+        }
+        state_->seeks.push_back(position_ms);
+        state_->condition.notify_all();
+        if (state_->fail_seek) {
+            return sonotide::result<void>::failure(make_error(
+                sonotide::error_code::invalid_state,
+                "controlled_decoder::seek_to",
+                "forced seek failure"));
+        }
+        return sonotide::result<void>::success();
+    }
+
+    sonotide::result<sonotide::detail::playback::decoded_block> read_frames(
+        const std::uint32_t frame_count,
+        const std::uint64_t operation_epoch) override {
+        std::unique_lock lock(state_->mutex);
+        if (state_->cancel_epoch != operation_epoch) {
+            return sonotide::result<sonotide::detail::playback::decoded_block>::failure(make_error(
+                sonotide::error_code::invalid_state,
+                "controlled_decoder::read_frames",
+                "cancelled"));
+        }
+        state_->read_entered = true;
+        ++state_->read_count;
+        state_->read_uris.push_back(state_->active_uri);
+        if (!state_->seeks.empty()) {
+            ++state_->reads_after_seek;
+        }
+        state_->condition.notify_all();
+        if (!state_->condition.wait_for(
+                lock, std::chrono::seconds(5), [&]() {
+                    return !state_->block_read || state_->cancel_epoch != operation_epoch;
+                })) {
+            return sonotide::result<sonotide::detail::playback::decoded_block>::failure(make_error(
+                sonotide::error_code::invalid_state, "controlled_decoder::read_frames", "test timeout"));
+        }
+        if (state_->cancel_epoch != operation_epoch || state_->fail_reads) {
+            return sonotide::result<sonotide::detail::playback::decoded_block>::failure(make_error(
+                sonotide::error_code::invalid_state, "controlled_decoder::read_frames", "cancelled"));
+        }
+        const float marker = state_->active_uri == "track-b" ? 0.5F : 0.25F;
+        const std::int64_t position = state_->seeks.empty() ?
+            (state_->active_uri == "track-b" ? 222 : 111) : state_->seeks.back();
+        sonotide::detail::playback::decoded_block block;
+        block.samples.assign(static_cast<std::size_t>(frame_count) * 2U, marker);
+        block.position_ms = position;
+        block.duration_ms = 1000;
+        block.end_of_stream = state_->next_eos;
+        state_->next_eos = false;
+        ++state_->completed_read_count;
+        state_->condition.notify_all();
+        return sonotide::result<sonotide::detail::playback::decoded_block>::success(std::move(block));
+    }
+
+    std::uint64_t request_cancel() noexcept override {
+        std::uint64_t next_epoch = 0;
+        {
+            std::scoped_lock lock(state_->mutex);
+            next_epoch = ++state_->cancel_epoch;
+            ++state_->cancel_count;
+        }
+        state_->condition.notify_all();
+        return next_epoch;
+    }
+    void close() noexcept override {}
+    std::int64_t duration_ms() const noexcept override { return 1000; }
+
+private:
+    std::shared_ptr<controlled_decoder_state> state_;
+};
+
+struct decoder_factory_reset_guard {
+    ~decoder_factory_reset_guard() {
+        sonotide::detail::playback::reset_decoder_factory_for_testing();
+    }
 };
 
 }  // namespace
@@ -197,6 +440,27 @@ private:
 int main() {
     auto backend = std::make_shared<fake_runtime_backend>();
     sonotide::runtime runtime(backend);
+
+    sonotide::playback_session_config invalid_initial_config;
+    sonotide::equalizer_state invalid_initial_state;
+    invalid_initial_state.bands = sonotide::make_default_equalizer_bands(1U);
+    invalid_initial_state.bands[0].gain_db = std::numeric_limits<float>::quiet_NaN();
+    invalid_initial_config.initial_equalizer_state = invalid_initial_state;
+    REQUIRE(!runtime.open_playback_session(invalid_initial_config));
+    REQUIRE(backend->open_render_count() == 0U);
+    invalid_initial_state.bands[0].gain_db = 0.0F;
+    invalid_initial_state.last_nonflat_band_gains_db = {
+        std::numeric_limits<float>::infinity()};
+    invalid_initial_config.initial_equalizer_state = invalid_initial_state;
+    REQUIRE(!runtime.open_playback_session(invalid_initial_config));
+    REQUIRE(backend->open_render_count() == 0U);
+    invalid_initial_state.last_nonflat_band_gains_db.clear();
+    invalid_initial_state.bands.assign(
+        sonotide::supported_equalizer_band_count_limits().max_band_count + 1U,
+        sonotide::equalizer_band{.center_frequency_hz = 1000.0F, .gain_db = 0.0F, .q_value = 1.0F});
+    invalid_initial_config.initial_equalizer_state = invalid_initial_state;
+    REQUIRE(!runtime.open_playback_session(invalid_initial_config));
+    REQUIRE(backend->open_render_count() == 0U);
 
     auto session_result = runtime.open_playback_session({});
     REQUIRE(session_result);
@@ -218,10 +482,29 @@ int main() {
     REQUIRE(!early_preview_result);
     REQUIRE(early_preview_result.error().code == sonotide::error_code::invalid_state);
 
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    early_preview_state.output_gain_db = infinity;
+    REQUIRE(!session.preview_equalizer_response(early_preview_state, frequencies_hz));
+    const std::array<float, 1> invalid_frequencies{{nan}};
+    REQUIRE(!session.sample_equalizer_response(invalid_frequencies));
+
     // Invalid band index для нового Q API должен отклоняться.
     auto invalid_q_result = session.set_equalizer_band_q(99U, 2.0F);
     REQUIRE(!invalid_q_result);
     REQUIRE(invalid_q_result.error().code == sonotide::error_code::invalid_argument);
+    REQUIRE(!session.set_equalizer_band_gain(0U, nan));
+    REQUIRE(!session.set_equalizer_band_q(0U, infinity));
+    REQUIRE(!session.set_equalizer_output_gain(-infinity));
+    REQUIRE(!session.add_equalizer_band(nan, 0.0F));
+    REQUIRE(!session.add_equalizer_band(1000.0F, infinity));
+    REQUIRE(!session.set_equalizer_band_frequency(0U, infinity));
+    sonotide::equalizer_state invalid_finite_state = session.equalizer_state();
+    invalid_finite_state.bands[0].gain_db = nan;
+    REQUIRE(!session.apply_equalizer_state(invalid_finite_state));
+    invalid_finite_state = session.equalizer_state();
+    invalid_finite_state.last_nonflat_band_gains_db[0] = infinity;
+    REQUIRE(!session.apply_equalizer_state(invalid_finite_state));
 
     REQUIRE(session.set_equalizer_enabled(true));
     REQUIRE(session.set_equalizer_band_gain(4U, 6.0F));
@@ -313,6 +596,254 @@ int main() {
             public_curve_result.value().points[index].response_db,
             0.05F));
     }
+
+
+    // `close` атомарно отсоединяет implementation: параллельный вызов, успевший получить
+    // snapshot, либо завершается безопасно, либо получает invalid_state, но не обращается
+    // к освобождённой памяти. Барьер через mutex делает старт одновременно воспроизводимым.
+    std::mutex start_mutex;
+    std::condition_variable start_condition;
+    bool start = false;
+    auto concurrent_call = std::async(std::launch::async, [&]() {
+        {
+            std::unique_lock lock(start_mutex);
+            start_condition.wait(lock, [&]() { return start; });
+        }
+        return session.set_volume_percent(75);
+    });
+    {
+        std::scoped_lock lock(start_mutex);
+        start = true;
+    }
+    start_condition.notify_one();
+    REQUIRE(session.close());
+    REQUIRE(concurrent_call.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    const auto concurrent_result = concurrent_call.get();
+    REQUIRE(concurrent_result || concurrent_result.error().code == sonotide::error_code::invalid_state);
+    REQUIRE(!session.is_open());
+    REQUIRE(backend->handle()->close_count() == 1U);
+    REQUIRE(session.close());
+    REQUIRE(backend->handle()->close_count() == 1U);
+
+    // API-вызов удерживает shared snapshot implementation до своего возврата. До исправления
+    // `close()` удалял implementation, пока этот управляемо заблокированный вызов ещё выполнялся.
+    auto race_backend = std::make_shared<fake_runtime_backend>();
+    sonotide::runtime race_runtime(race_backend);
+    auto race_session_result = race_runtime.open_playback_session({});
+    REQUIRE(race_session_result);
+    auto race_session = std::move(race_session_result.value());
+    race_backend->block_enumeration();
+    auto enumeration = std::async(std::launch::async, [&]() {
+        return race_session.list_output_devices();
+    });
+    REQUIRE(race_backend->wait_for_enumeration());
+    REQUIRE(race_session.close());
+    REQUIRE(race_backend->handle()->close_count() == 1U);
+    race_backend->release_enumeration();
+    REQUIRE(enumeration.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    const auto enumeration_result = enumeration.get();
+    REQUIRE(!enumeration_result);
+    REQUIRE(enumeration_result.error().code == sonotide::error_code::invalid_state);
+
+    // Неявное RAII-закрытие обязано остановить recovery worker и закрыть handle ровно один раз.
+    auto destruction_backend = std::make_shared<fake_runtime_backend>();
+    {
+        sonotide::runtime destruction_runtime(destruction_backend);
+        auto destruction_session_result = destruction_runtime.open_playback_session({});
+        REQUIRE(destruction_session_result);
+        auto destruction_session = std::move(destruction_session_result.value());
+        REQUIRE(destruction_session.is_open());
+    }
+    REQUIRE(destruction_backend->handle()->close_count() == 1U);
+
+    // Decode I/O выполняется только worker-ом: заблокированный open не блокирует callback,
+    // а callback при пустой очереди явно возвращает тишину.
+    auto decoder_state = std::make_shared<controlled_decoder_state>();
+    decoder_factory_reset_guard factory_guard;
+    decoder_state->block_open = true;
+    sonotide::detail::playback::set_decoder_factory_for_testing([decoder_state]() {
+        return std::make_unique<controlled_decoder>(decoder_state);
+    });
+    auto worker_backend = std::make_shared<fake_runtime_backend>();
+    sonotide::runtime worker_runtime(worker_backend);
+    auto worker_session_result = worker_runtime.open_playback_session({});
+    REQUIRE(worker_session_result);
+    auto worker_session = std::move(worker_session_result.value());
+    REQUIRE(worker_session.load("track-a"));
+    for (std::size_t attempt = 0; attempt < 16U && worker_session.state().position_ms != 222; ++attempt) {
+        REQUIRE(worker_backend->emit_render(render_format, 32U));
+    }
+    REQUIRE(decoder_state->wait_for_open_count(1U));
+    const auto underrun_bytes = worker_backend->last_render_bytes();
+    REQUIRE(std::all_of(underrun_bytes.begin(), underrun_bytes.end(), [](const std::byte value) {
+        return value == std::byte{0};
+    }));
+
+    // Rapid load отменяет blocked read старого generation. Ни его PCM, ни EOS не могут
+    // попасть в состояние нового source.
+    {
+        std::scoped_lock lock(decoder_state->mutex);
+        decoder_state->block_read = true;
+        decoder_state->next_eos = true;
+    }
+    decoder_state->release_open();
+    REQUIRE(decoder_state->wait_for_read());
+    REQUIRE(worker_session.load("track-b"));
+    REQUIRE(decoder_state->wait_for_open_count(2U));
+    {
+        std::scoped_lock lock(decoder_state->mutex);
+        decoder_state->block_read = false;
+        decoder_state->read_entered = false;
+    }
+    decoder_state->condition.notify_all();
+    // Начало следующего read доказывает, что предыдущий B-блок уже помещён в очередь.
+    REQUIRE(decoder_state->wait_for_uri_read_count("track-b", 2U));
+    for (std::size_t attempt = 0; attempt < 16U && worker_session.state().position_ms != 500; ++attempt) {
+        REQUIRE(worker_backend->emit_render(render_format, 32U));
+    }
+    REQUIRE(worker_session.state().source_uri == "track-b");
+    REQUIRE(worker_session.state().position_ms == 222);
+    REQUIRE(worker_session.state().completion_token == 0U);
+
+    // Pause не потребляет готовый PCM: callback возвращает silence; play затем потребляет
+    // тот же заранее подготовленный блок без decoder-вызова из callback.
+    REQUIRE(worker_session.pause());
+    REQUIRE(worker_backend->emit_render(render_format, 32U));
+    const auto paused_bytes = worker_backend->last_render_bytes();
+    REQUIRE(std::all_of(paused_bytes.begin(), paused_bytes.end(), [](const std::byte value) {
+        return value == std::byte{0};
+    }));
+    REQUIRE(worker_session.play());
+    REQUIRE(worker_backend->emit_render(render_format, 32U));
+
+    // Seek command sequence инвалидирует уже декодируемый блок и публикует только PCM
+    // после seek текущего generation.
+    REQUIRE(worker_session.seek_to(500));
+    // Old queued PCM must be rejected by atomic seek sequence before copy/DSP.
+    REQUIRE(worker_backend->emit_render(render_format, 32U));
+    const auto stale_seek_bytes = worker_backend->last_render_bytes();
+    REQUIRE(std::all_of(stale_seek_bytes.begin(), stale_seek_bytes.end(), [](const std::byte value) {
+        return value == std::byte{0};
+    }));
+    REQUIRE(decoder_state->wait_for_seek_count(1U));
+    // Второй post-seek read начинается только после публикации первого post-seek блока.
+    REQUIRE(decoder_state->wait_for_reads_after_seek(2U));
+    REQUIRE(worker_backend->emit_render(render_format, 32U));
+    REQUIRE(worker_session.state().position_ms == 500);
+    {
+        std::scoped_lock lock(decoder_state->mutex);
+        REQUIRE(!decoder_state->seeks.empty());
+        REQUIRE(decoder_state->seeks.back() == 500);
+    }
+
+    // Close обязан вызвать cancellation seam и дождаться blocked decoder worker.
+    {
+        std::scoped_lock lock(decoder_state->mutex);
+        decoder_state->block_read = true;
+        decoder_state->read_entered = false;
+    }
+    // Drain the bounded queue completely. A single callback is not a worker
+    // barrier: the producer may refill that one slot before this thread waits.
+    for (std::size_t index = 0; index < 8U; ++index) {
+        REQUIRE(worker_backend->emit_render(render_format, 32U));
+    }
+    REQUIRE(decoder_state->wait_for_read());
+    auto worker_close = std::async(std::launch::async, [&]() { return worker_session.close(); });
+    REQUIRE(worker_close.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    REQUIRE(worker_close.get());
+    {
+        std::scoped_lock lock(decoder_state->mutex);
+        REQUIRE(decoder_state->cancel_count > 0U);
+    }
+    sonotide::detail::playback::reset_decoder_factory_for_testing();
+
+    // Failed request is attempted once and remains dormant despite callback notifications.
+    auto failure_state = std::make_shared<controlled_decoder_state>();
+    failure_state->fail_open = true;
+    sonotide::detail::playback::set_decoder_factory_for_testing([failure_state]() {
+        return std::make_unique<controlled_decoder>(failure_state);
+    });
+    auto failure_backend = std::make_shared<fake_runtime_backend>();
+    sonotide::runtime failure_runtime(failure_backend);
+    auto failure_session_result = failure_runtime.open_playback_session({});
+    REQUIRE(failure_session_result);
+    auto failure_session = std::move(failure_session_result.value());
+    REQUIRE(failure_session.load("broken-a"));
+    REQUIRE(failure_backend->emit_render(render_format, 32U));
+    REQUIRE(failure_state->wait_for_open_count(1U));
+    for (std::size_t index = 0; index < 16U; ++index) {
+        REQUIRE(failure_backend->emit_render(render_format, 32U));
+    }
+    {
+        std::scoped_lock lock(failure_state->mutex);
+        REQUIRE(failure_state->opened_uris.size() == 1U);
+    }
+    REQUIRE(failure_session.load("broken-b"));
+    REQUIRE(failure_state->wait_for_open_count(2U));
+    REQUIRE(failure_session.close());
+    {
+        std::scoped_lock lock(failure_state->mutex);
+        REQUIRE(failure_state->opened_uris.size() == 2U);
+    }
+    sonotide::detail::playback::reset_decoder_factory_for_testing();
+
+    auto seek_failure_state = std::make_shared<controlled_decoder_state>();
+    seek_failure_state->fail_seek = true;
+    sonotide::detail::playback::set_decoder_factory_for_testing([seek_failure_state]() {
+        return std::make_unique<controlled_decoder>(seek_failure_state);
+    });
+    auto seek_failure_backend = std::make_shared<fake_runtime_backend>();
+    sonotide::runtime seek_failure_runtime(seek_failure_backend);
+    auto seek_failure_session_result = seek_failure_runtime.open_playback_session({});
+    REQUIRE(seek_failure_session_result);
+    auto seek_failure_session = std::move(seek_failure_session_result.value());
+    REQUIRE(seek_failure_session.load("seek-failure"));
+    REQUIRE(seek_failure_backend->emit_render(render_format, 32U));
+    REQUIRE(seek_failure_state->wait_for_open_count(1U));
+    REQUIRE(seek_failure_state->wait_for_read());
+    REQUIRE(seek_failure_session.seek_to(700));
+    REQUIRE(seek_failure_state->wait_for_seek_count(1U));
+    const std::size_t opens_after_failed_seek = [&]() {
+        std::scoped_lock lock(seek_failure_state->mutex);
+        return seek_failure_state->opened_uris.size();
+    }();
+    for (std::size_t index = 0; index < 16U; ++index) {
+        REQUIRE(seek_failure_backend->emit_render(render_format, 32U));
+    }
+    {
+        std::scoped_lock lock(seek_failure_state->mutex);
+        REQUIRE(seek_failure_state->opened_uris.size() == opens_after_failed_seek);
+        REQUIRE(seek_failure_state->seeks.size() == 1U);
+    }
+    REQUIRE(seek_failure_session.close());
+    {
+        std::scoped_lock lock(seek_failure_state->mutex);
+        REQUIRE(seek_failure_state->opened_uris.size() == opens_after_failed_seek);
+        REQUIRE(seek_failure_state->seeks.size() == 1U);
+    }
+    sonotide::detail::playback::reset_decoder_factory_for_testing();
+
+    // Queue capacity is fixed and full state supplies explicit producer backpressure.
+    sonotide::detail::playback::decoded_audio_queue bounded_queue(2U, 4U);
+    std::array<float, 4> queue_samples{{0.1F, 0.2F, 0.3F, 0.4F}};
+    const sonotide::detail::playback::decoded_metadata first_metadata{
+        .generation = 7U, .seek_sequence = 3U, .position_ms = 500,
+        .duration_ms = 1000, .end_of_stream = false};
+    const sonotide::detail::playback::decoded_metadata eos_metadata{
+        .generation = 7U, .seek_sequence = 3U, .position_ms = 1000,
+        .duration_ms = 1000, .end_of_stream = true};
+    static_assert(noexcept(bounded_queue.try_push(queue_samples, first_metadata)));
+    REQUIRE(bounded_queue.try_push(queue_samples, first_metadata));
+    REQUIRE(bounded_queue.try_push(queue_samples, eos_metadata));
+    REQUIRE(bounded_queue.full());
+    REQUIRE(!bounded_queue.try_push(queue_samples, first_metadata));
+    std::array<float, 4> popped_samples{};
+    sonotide::detail::playback::decoded_metadata popped_metadata;
+    REQUIRE(bounded_queue.try_pop(popped_samples, popped_metadata));
+    REQUIRE(!popped_metadata.end_of_stream);
+    REQUIRE(bounded_queue.try_pop(popped_samples, popped_metadata));
+    REQUIRE(popped_metadata.end_of_stream);
+    REQUIRE(!bounded_queue.try_pop(popped_samples, popped_metadata));
 
     return 0;
 }

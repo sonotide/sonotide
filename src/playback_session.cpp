@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <cstring>
 #include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,10 +20,12 @@
 
 #include "internal/dsp/equalizer_chain.h"
 #include "internal/equalizer_layout_utils.h"
+#include "internal/playback/decoded_audio_queue.h"
+#include "internal/playback/playback_decoder.h"
 #include "internal/runtime_backend.h"
 
 #if defined(_WIN32)
-#include "internal/win/media_foundation_decoder.h"
+#include "internal/win/com_scope.h"
 #endif
 
 namespace sonotide {
@@ -146,14 +150,18 @@ void convert_float_to_buffer(
     std::span<std::byte> destination) {
     const std::size_t sample_count = static_cast<std::size_t>(frame_count) * format.channel_count;
     if (format.sample == sample_type::float32) {
-        std::memcpy(destination.data(), source_samples, sample_count * sizeof(float));
+        auto* samples = reinterpret_cast<float*>(destination.data());
+        for (std::size_t index = 0; index < sample_count; ++index) {
+            samples[index] = std::isfinite(source_samples[index]) ? source_samples[index] : 0.0F;
+        }
         return;
     }
 
     if (format.sample == sample_type::pcm_i16) {
         auto* samples = reinterpret_cast<std::int16_t*>(destination.data());
         for (std::size_t index = 0; index < sample_count; ++index) {
-            const float value = (std::clamp)(source_samples[index], -1.0F, 1.0F);
+            const float finite_value = std::isfinite(source_samples[index]) ? source_samples[index] : 0.0F;
+            const float value = (std::clamp)(finite_value, -1.0F, 1.0F);
             samples[index] = static_cast<std::int16_t>(value * 32767.0F);
         }
         return;
@@ -164,7 +172,8 @@ void convert_float_to_buffer(
         const float scale =
             format.sample == sample_type::pcm_i24_in_32 ? 8388607.0F : 2147483647.0F;
         for (std::size_t index = 0; index < sample_count; ++index) {
-            const float value = (std::clamp)(source_samples[index], -1.0F, 1.0F);
+            const float finite_value = std::isfinite(source_samples[index]) ? source_samples[index] : 0.0F;
+            const float value = (std::clamp)(finite_value, -1.0F, 1.0F);
             samples[index] = static_cast<std::int32_t>(value * scale);
         }
         return;
@@ -187,28 +196,57 @@ error make_error(
     return failure;
 }
 
-#if !defined(_WIN32)
-// Небольшой запасной блок для сборок не под Windows, чтобы код продолжал собираться.
-struct fallback_decoded_audio_block {
-    // Сырые декодированные PCM-сэмплы или эквивалент тишины.
-    std::vector<float> samples;
-    // Текущая позиция воспроизведения в миллисекундах.
-    std::int64_t position_ms = 0;
-    // Полная длительность источника в миллисекундах.
-    std::int64_t duration_ms = 0;
-    // Сигнализирует, что декодер дошёл до конца источника.
-    bool end_of_stream = false;
+}  // namespace
+
+namespace {
+struct decoded_pipeline_payload {
+    decoded_pipeline_payload(
+        const std::size_t queue_slots,
+        const std::size_t samples_per_slot,
+        audio_format stream_format,
+        const std::uint32_t stream_frame_count)
+        : queue(queue_slots, samples_per_slot),
+          render_scratch(samples_per_slot),
+          format(stream_format),
+          frame_count(stream_frame_count) {
+        equalizer.configure(
+            static_cast<float>(format.sample_rate),
+            static_cast<std::size_t>(format.channel_count));
+        equalizer.prepare(frame_count);
+        equalizer.reset();
+    }
+
+    detail::playback::decoded_audio_queue queue;
+    std::vector<float> render_scratch;
+    detail::dsp::equalizer_chain equalizer;
+    std::uint64_t applied_equalizer_control_version = (std::numeric_limits<std::uint64_t>::max)();
+    audio_format format{};
+    std::uint32_t frame_count = 0;
 };
-#endif
 
-#if defined(_WIN32)
-// В сборках под Windows используется реальный блок декодера Media Foundation.
-using decoded_audio_block_result = result<detail::win::decoded_audio_block>;
-#else
-// Сборки не под Windows используют запасной блок только для совместимости при компиляции.
-using decoded_audio_block_result = result<fallback_decoded_audio_block>;
-#endif
+struct decoded_pipeline {
+    void rebuild(
+        const std::size_t samples_per_slot,
+        const audio_format& format,
+        const std::uint32_t frame_count) {
+        payload = std::make_unique<decoded_pipeline_payload>(
+            4U, samples_per_slot, format, frame_count);
+    }
 
+    std::unique_ptr<decoded_pipeline_payload> payload;
+};
+static_assert(std::atomic<decoded_pipeline*>::is_always_lock_free);
+
+class render_hazard_guard {
+public:
+    explicit render_hazard_guard(std::atomic<decoded_pipeline*>& hazard) noexcept
+        : hazard_(hazard) {}
+    ~render_hazard_guard() { hazard_.store(nullptr, std::memory_order_seq_cst); }
+    render_hazard_guard(const render_hazard_guard&) = delete;
+    render_hazard_guard& operator=(const render_hazard_guard&) = delete;
+private:
+    std::atomic<decoded_pipeline*>& hazard_;
+};
 }  // namespace
 
 class playback_session::implementation {
@@ -217,8 +255,27 @@ public:
     static result<playback_session> create(
         std::shared_ptr<detail::runtime_backend> backend,
         const playback_session_config& config) {
+        if (config.initial_equalizer_state.has_value()) {
+            const auto& initial = *config.initial_equalizer_state;
+            const bool invalid = initial.bands.size() > supported_equalizer_band_count_limits().max_band_count ||
+                !std::isfinite(initial.output_gain_db) ||
+                std::any_of(initial.bands.begin(), initial.bands.end(), [](const equalizer_band& band) {
+                    return !std::isfinite(band.center_frequency_hz) ||
+                           !std::isfinite(band.gain_db) || !std::isfinite(band.q_value);
+                }) || std::any_of(
+                    initial.last_nonflat_band_gains_db.begin(),
+                    initial.last_nonflat_band_gains_db.end(),
+                    [](const float value) { return !std::isfinite(value); });
+            if (invalid) {
+                return result<playback_session>::failure(make_error(
+                    error_category::configuration,
+                    error_code::invalid_argument,
+                    "playback_session::create",
+                    "Initial equalizer state must contain only finite values and supported band count."));
+            }
+        }
         // Сначала создаём объект, чтобы при ошибке открытия можно было безопасно вернуть структурированную ошибку.
-        auto instance = std::unique_ptr<implementation>(
+        auto instance = std::shared_ptr<implementation>(
             new implementation(std::move(backend), config));
         // Поток рендеринга должен быть открыт до того, как публичный объект будет возвращён.
         auto open_result = instance->open_render_stream();
@@ -226,10 +283,38 @@ public:
             return result<playback_session>::failure(open_result.error());
         }
 
-        // Восстановление ждёт в отдельном потоке, чтобы обратный вызов рендеринга оставался лёгким.
-        instance->recovery_thread_ = std::thread([owner = instance.get()]() {
-            owner->recovery_loop();
-        });
+        // Восстановление и decode живут вне audio callback. Ошибка создания
+        // системного потока остаётся в result-контракте публичной фабрики.
+        try {
+            instance->recovery_thread_ = std::thread([owner = instance.get()]() {
+                owner->recovery_loop();
+            });
+            instance->decode_thread_ = std::thread([owner = instance.get()]() {
+                owner->decode_worker_entry();
+            });
+        } catch (const std::exception& exception) {
+            try {
+                (void)instance->close();
+            } catch (...) {
+                // Preserve the original startup diagnostic.
+            }
+            return result<playback_session>::failure(make_error(
+                error_category::initialization,
+                error_code::initialization_failed,
+                "playback_session::create",
+                std::string("Failed to start playback worker threads: ") + exception.what()));
+        } catch (...) {
+            try {
+                (void)instance->close();
+            } catch (...) {
+                // Preserve the original startup diagnostic.
+            }
+            return result<playback_session>::failure(make_error(
+                error_category::initialization,
+                error_code::initialization_failed,
+                "playback_session::create",
+                "Failed to start playback worker threads."));
+        }
 
         return result<playback_session>::success(
             playback_session(std::move(instance)));
@@ -241,7 +326,8 @@ public:
         playback_session_config config)
         : backend_(std::move(backend)),
           config_(std::move(config)),
-          callback_(*this) {
+          callback_(*this),
+          decoder_(detail::playback::make_decoder()) {
         // Сохраняем запрошенное предпочтительное устройство, чтобы снимок отражал намерение вызывающего.
         state_.preferred_output_device_id =
             config_.render.device.selection_mode == device_selector::mode::explicit_id
@@ -257,8 +343,13 @@ public:
     }
 
     // Гарантирует выполнение логики завершения даже если вызывающий не закрыл сессию явно.
-    ~implementation() {
-        close();
+    ~implementation() noexcept {
+        try {
+            (void)close();
+        } catch (...) {
+            // Explicit close() is the diagnostic path. Destruction must not
+            // terminate the process if a system synchronization primitive fails.
+        }
     }
 
     // Показывает, владеет ли сессия ещё живым состоянием runtime.
@@ -277,29 +368,47 @@ public:
                 "Source URI must not be empty."));
         }
 
-        std::scoped_lock lock(mutex_);
-        // Счётчики поколений позволяют обратному вызову рендеринга отличать устаревшие запросы на загрузку.
-        requested_source_uri_ = std::move(source_uri);
-        ++requested_source_generation_;
-        // Отложенный seek очищается, потому что новый источник должен стартовать с начала.
-        pending_seek_ms_.reset();
-        state_.source_uri = requested_source_uri_;
-        state_.status = config_.auto_play_on_load ? playback_status::loading : playback_status::paused;
-        state_.error_message.clear();
-        state_.position_ms = 0;
-        state_.duration_ms = 0;
-        state_.device_lost = false;
-        state_.completion_token = 0;
-        playback_intent_playing_ = config_.auto_play_on_load;
-        decoder_ready_ = false;
-        reached_end_of_stream_ = false;
-        equalizer_state_.error_message.clear();
+        std::scoped_lock command_lock(decoder_command_mutex_);
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result("playback_session::load");
+            }
+        }
+        const std::uint64_t command_epoch = decoder_->request_cancel();
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result("playback_session::load");
+            }
+            requested_source_uri_ = std::move(source_uri);
+            ++requested_source_generation_;
+            requested_decoder_epoch_ = command_epoch;
+            requested_generation_atomic_.store(requested_source_generation_, std::memory_order_release);
+            pending_seek_ms_.reset();
+            requested_seek_sequence_atomic_.store(requested_seek_sequence_, std::memory_order_release);
+            state_.source_uri = requested_source_uri_;
+            state_.status = config_.auto_play_on_load ? playback_status::loading : playback_status::paused;
+            state_.error_message.clear();
+            state_.position_ms = 0;
+            state_.duration_ms = 0;
+            state_.device_lost = false;
+            state_.completion_token = 0;
+            playback_intent_playing_ = config_.auto_play_on_load;
+            decoder_ready_ = false;
+            reached_end_of_stream_ = false;
+            equalizer_state_.error_message.clear();
+            decode_condition_.notify_all();
+        }
         return result<void>::success();
     }
 
     // Запрашивает запуск транспорта; реальная работа с декодером остаётся за рабочим потоком.
     result<void> play() {
         std::scoped_lock lock(mutex_);
+        if (closed_) {
+            return closed_session_result("playback_session::play");
+        }
         if (requested_source_uri_.empty()) {
             state_.status = playback_status::error;
             state_.error_message = "Playback session has no loaded source.";
@@ -312,52 +421,78 @@ public:
 
         if (reached_end_of_stream_) {
             pending_seek_ms_ = 0;
+            ++requested_seek_sequence_;
+            requested_seek_sequence_atomic_.store(requested_seek_sequence_, std::memory_order_release);
             reached_end_of_stream_ = false;
         }
 
         playback_intent_playing_ = true;
         state_.status = decoder_ready_ ? playback_status::playing : playback_status::loading;
         state_.error_message.clear();
+        decode_condition_.notify_all();
         return result<void>::success();
     }
 
     // Запрашивает паузу транспорта, сохраняя загруженный источник и снимок таймлайна.
     result<void> pause() {
         std::scoped_lock lock(mutex_);
+        if (closed_) {
+            return closed_session_result("playback_session::pause");
+        }
         playback_intent_playing_ = false;
         state_.status = requested_source_uri_.empty() ? playback_status::idle : playback_status::paused;
         state_.error_message.clear();
+        decode_condition_.notify_all();
         return result<void>::success();
     }
 
     // Планирует seek декодера на следующем тике обратного вызова рендеринга.
     result<void> seek_to(std::int64_t position_ms) {
-        std::scoped_lock lock(mutex_);
-        if (requested_source_uri_.empty()) {
-            return result<void>::failure(make_error(
-                error_category::stream,
-                error_code::invalid_state,
-                "playback_session::seek_to",
-                "Cannot seek before a source has been loaded."));
+        std::scoped_lock command_lock(decoder_command_mutex_);
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result("playback_session::seek_to");
+            }
+            if (requested_source_uri_.empty()) {
+                return result<void>::failure(make_error(
+                    error_category::stream,
+                    error_code::invalid_state,
+                    "playback_session::seek_to",
+                    "Cannot seek before a source has been loaded."));
+            }
         }
-
-        pending_seek_ms_ = (std::max)(position_ms, static_cast<std::int64_t>(0));
-        reached_end_of_stream_ = false;
-        state_.position_ms = *pending_seek_ms_;
-        state_.status = playback_intent_playing_ ? playback_status::loading : playback_status::paused;
-        state_.error_message.clear();
+        const std::uint64_t command_epoch = decoder_->request_cancel();
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_ || requested_source_uri_.empty()) {
+                return closed_session_result("playback_session::seek_to");
+            }
+            pending_seek_ms_ = (std::max)(position_ms, static_cast<std::int64_t>(0));
+            ++requested_seek_sequence_;
+            requested_decoder_epoch_ = command_epoch;
+            requested_seek_sequence_atomic_.store(requested_seek_sequence_, std::memory_order_release);
+            reached_end_of_stream_ = false;
+            state_.position_ms = *pending_seek_ms_;
+            state_.status = playback_intent_playing_ ? playback_status::loading : playback_status::paused;
+            state_.error_message.clear();
+            decode_condition_.notify_all();
+        }
         return result<void>::success();
     }
 
     // Сохраняет пользовательскую громкость в процентах, а слой DSP преобразует её позже.
     result<void> set_volume_percent(int volume_percent) {
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_volume_percent");
         state_.volume_percent = (std::clamp)(volume_percent, 0, 100);
+        ++equalizer_control_version_;
         return result<void>::success();
     }
 
     result<void> set_equalizer_enabled(const bool enabled) {
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_equalizer_enabled");
         equalizer_state_.enabled = enabled;
         recompute_equalizer_metadata_locked(current_sample_rate_or_default_locked());
         return result<void>::success();
@@ -365,6 +500,7 @@ public:
 
     result<void> select_equalizer_preset(const equalizer_preset_id preset_id) {
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::select_equalizer_preset");
         if (preset_id == equalizer_preset_id::custom) {
             return result<void>::success();
         }
@@ -396,7 +532,11 @@ public:
     }
 
     result<void> set_equalizer_band_gain(const std::size_t band_index, const float gain_db) {
+        if (!std::isfinite(gain_db)) {
+            return invalid_finite_value_result("playback_session::set_equalizer_band_gain");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_equalizer_band_gain");
         if (band_index >= equalizer_state_.bands.size()) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -413,7 +553,11 @@ public:
     }
 
     result<void> set_equalizer_band_q(const std::size_t band_index, const float q_value) {
+        if (!std::isfinite(q_value)) {
+            return invalid_finite_value_result("playback_session::set_equalizer_band_q");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_equalizer_band_q");
         if (band_index >= equalizer_state_.bands.size()) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -428,7 +572,11 @@ public:
     }
 
     result<void> add_equalizer_band(const float center_frequency_hz, const float gain_db) {
+        if (!std::isfinite(center_frequency_hz) || !std::isfinite(gain_db)) {
+            return invalid_finite_value_result("playback_session::add_equalizer_band");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::add_equalizer_band");
         if (equalizer_state_.bands.size() >= supported_equalizer_band_count_limits().max_band_count) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -489,6 +637,7 @@ public:
 
     result<void> remove_equalizer_band(const std::size_t band_index) {
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::remove_equalizer_band");
         if (band_index >= equalizer_state_.bands.size()) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -507,7 +656,11 @@ public:
     result<void> set_equalizer_band_frequency(
         const std::size_t band_index,
         const float center_frequency_hz) {
+        if (!std::isfinite(center_frequency_hz)) {
+            return invalid_finite_value_result("playback_session::set_equalizer_band_frequency");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_equalizer_band_frequency");
         if (band_index >= equalizer_state_.bands.size()) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -550,13 +703,29 @@ public:
     }
 
     result<void> set_equalizer_output_gain(const float output_gain_db) {
+        if (!std::isfinite(output_gain_db)) {
+            return invalid_finite_value_result("playback_session::set_equalizer_output_gain");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::set_equalizer_output_gain");
         equalizer_state_.output_gain_db = clamp_equalizer_gain_db(output_gain_db);
+        ++equalizer_control_version_;
         return result<void>::success();
     }
 
     result<void> apply_equalizer_state(const sonotide::equalizer_state& state) {
+        if (!std::isfinite(state.output_gain_db) || std::any_of(
+                state.bands.begin(), state.bands.end(), [](const equalizer_band& band) {
+                    return !std::isfinite(band.center_frequency_hz) ||
+                           !std::isfinite(band.gain_db) || !std::isfinite(band.q_value);
+                }) || std::any_of(
+                    state.last_nonflat_band_gains_db.begin(),
+                    state.last_nonflat_band_gains_db.end(),
+                    [](const float value) { return !std::isfinite(value); })) {
+            return invalid_finite_value_result("playback_session::apply_equalizer_state");
+        }
         std::scoped_lock lock(mutex_);
+        if (closed_) return closed_session_result("playback_session::apply_equalizer_state");
         if (state.bands.size() > supported_equalizer_band_count_limits().max_band_count) {
             return result<void>::failure(make_error(
                 error_category::configuration,
@@ -582,12 +751,36 @@ public:
     }
 
     result<std::vector<device_info>> list_output_devices() const {
-        return backend_->enumerate_devices(device_direction::render);
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result<std::vector<device_info>>(
+                    "playback_session::list_output_devices");
+            }
+        }
+        auto devices_result = backend_->enumerate_devices(device_direction::render);
+        std::scoped_lock lock(mutex_);
+        if (closed_) {
+            return closed_session_result<std::vector<device_info>>(
+                "playback_session::list_output_devices");
+        }
+        return devices_result;
     }
 
     result<void> select_output_device(std::string device_id) {
+        std::scoped_lock command_lock(decoder_command_mutex_);
         {
             std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result("playback_session::select_output_device");
+            }
+        }
+        const std::uint64_t command_epoch = decoder_->request_cancel();
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result("playback_session::select_output_device");
+            }
             config_.render.device = device_id.empty()
                 ? device_selector::system_default(device_direction::render)
                 : device_selector::explicit_id(device_direction::render, std::move(device_id));
@@ -596,6 +789,9 @@ public:
                 ? config_.render.device.device_id
                 : "";
             pending_seek_ms_ = state_.position_ms;
+            ++requested_seek_sequence_;
+            requested_decoder_epoch_ = command_epoch;
+            requested_seek_sequence_atomic_.store(requested_seek_sequence_, std::memory_order_release);
             decoder_ready_ = false;
             reached_end_of_stream_ = false;
             equalizer_state_.status = equalizer_status::loading;
@@ -603,6 +799,7 @@ public:
             if (!requested_source_uri_.empty()) {
                 state_.status = playback_intent_playing_ ? playback_status::loading : playback_status::paused;
             }
+            decode_condition_.notify_all();
         }
 
         auto reopen_result = reopen_render_stream();
@@ -625,6 +822,26 @@ public:
     result<sonotide::equalizer_response_curve> preview_equalizer_response(
         const sonotide::equalizer_preview_state& preview_state,
         const std::span<const float> frequencies_hz) const {
+        if (!std::isfinite(preview_state.output_gain_db) ||
+            std::any_of(preview_state.bands.begin(), preview_state.bands.end(), [](const equalizer_band& band) {
+                return !std::isfinite(band.center_frequency_hz) ||
+                       !std::isfinite(band.gain_db) || !std::isfinite(band.q_value);
+            }) || std::any_of(frequencies_hz.begin(), frequencies_hz.end(), [](const float value) {
+                return !std::isfinite(value);
+            })) {
+            return closed_session_result<sonotide::equalizer_response_curve>(
+                "playback_session::preview_equalizer_response",
+                error_category::configuration,
+                error_code::invalid_argument,
+                "Equalizer values and sampled frequencies must be finite.");
+        }
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result<sonotide::equalizer_response_curve>(
+                    "playback_session::preview_equalizer_response");
+            }
+        }
         const std::optional<float> sample_rate_hz = resolve_equalizer_sample_rate_locked();
         if (!sample_rate_hz.has_value()) {
             return result<sonotide::equalizer_response_curve>::failure(make_error(
@@ -646,6 +863,22 @@ public:
 
     result<sonotide::equalizer_response_curve> sample_equalizer_response(
         const std::span<const float> frequencies_hz) const {
+        if (std::any_of(frequencies_hz.begin(), frequencies_hz.end(), [](const float value) {
+                return !std::isfinite(value);
+            })) {
+            return closed_session_result<sonotide::equalizer_response_curve>(
+                "playback_session::sample_equalizer_response",
+                error_category::configuration,
+                error_code::invalid_argument,
+                "Sampled frequencies must be finite.");
+        }
+        {
+            std::scoped_lock lock(mutex_);
+            if (closed_) {
+                return closed_session_result<sonotide::equalizer_response_curve>(
+                    "playback_session::sample_equalizer_response");
+            }
+        }
         const std::optional<float> sample_rate_hz = resolve_equalizer_sample_rate_locked();
         if (!sample_rate_hz.has_value()) {
             return result<sonotide::equalizer_response_curve>::failure(make_error(
@@ -670,6 +903,7 @@ public:
     }
 
     result<void> close() {
+        std::scoped_lock command_lock(decoder_command_mutex_);
         {
             std::scoped_lock lock(mutex_);
             if (closed_) {
@@ -679,133 +913,132 @@ public:
             shutting_down_ = true;
             recovery_requested_ = false;
             recovery_condition_.notify_all();
+            decode_condition_.notify_all();
+        }
+
+        if (decoder_) {
+            (void)decoder_->request_cancel();
+        }
+
+        if (decode_thread_.joinable()) {
+            decode_thread_.join();
         }
 
         if (recovery_thread_.joinable()) {
             recovery_thread_.join();
         }
 
+        std::scoped_lock stream_lock(stream_operation_mutex_);
+        decoded_pipeline_.store(nullptr, std::memory_order_seq_cst);
         auto close_result = render_stream_.close();
-#if defined(_WIN32)
-        decoder_.close();
-#endif
+        while (render_hazard_.load(std::memory_order_seq_cst) != nullptr) {
+            std::this_thread::yield();
+        }
+        if (decoder_) {
+            decoder_->close();
+        }
         return close_result;
     }
 
     result<void> on_render(audio_buffer_view buffer, stream_timestamp) {
-        std::string source_uri;
-        std::uint64_t generation = 0;
-        std::optional<std::int64_t> seek_ms;
+        write_silence(buffer);
+        negotiated_sample_rate_atomic_.store(
+            static_cast<float>(buffer.format.sample_rate), std::memory_order_release);
+
+        std::array<equalizer_band, equalizer_max_band_count> equalizer_bands{};
+        std::size_t active_equalizer_band_count = 0;
         int volume_percent = 100;
         bool should_play = false;
-        bool should_open_decoder = false;
-        bool reached_end_of_stream = false;
         bool equalizer_enabled = false;
         float equalizer_output_gain_db = 0.0F;
-        std::vector<equalizer_band> equalizer_bands;
+        float equalizer_headroom_db = 0.0F;
+        std::uint64_t equalizer_control_version = 0;
+        decoded_pipeline* pipeline = nullptr;
 
-        {
-            std::scoped_lock lock(mutex_);
-            state_.negotiated_format = buffer.format;
-            state_.device_lost = false;
-            source_uri = requested_source_uri_;
-            generation = requested_source_generation_;
-            volume_percent = state_.volume_percent;
-            should_play = playback_intent_playing_;
-            reached_end_of_stream = reached_end_of_stream_;
-            equalizer_enabled = equalizer_state_.enabled;
-            equalizer_output_gain_db = equalizer_state_.output_gain_db;
-            equalizer_bands = equalizer_state_.bands;
-            if (!source_uri.empty()) {
-                should_open_decoder =
-                    !decoder_ready_ ||
-                    active_source_generation_ != generation ||
-#if defined(_WIN32)
-                    !formats_match(decoder_.output_format(), buffer.format);
-#else
-                    true;
-#endif
+        std::unique_lock state_lock(mutex_, std::try_to_lock);
+        if (!state_lock.owns_lock() || shutting_down_) {
+            return result<void>::success();
+        }
+        const bool render_changed = !requested_render_format_.has_value() ||
+            !formats_match(*requested_render_format_, buffer.format) ||
+            requested_frame_count_ != buffer.frame_count;
+        state_.negotiated_format = buffer.format;
+        last_known_sample_rate_ = static_cast<float>(buffer.format.sample_rate);
+        state_.device_lost = false;
+        requested_render_format_ = buffer.format;
+        requested_frame_count_ = buffer.frame_count;
+        volume_percent = state_.volume_percent;
+        should_play = playback_intent_playing_ && !requested_source_uri_.empty();
+        equalizer_enabled = equalizer_state_.enabled;
+        equalizer_output_gain_db = equalizer_state_.output_gain_db;
+        equalizer_headroom_db = equalizer_state_.headroom_compensation_db;
+        equalizer_control_version = equalizer_control_version_;
+        active_equalizer_band_count = (std::min)(equalizer_state_.bands.size(), equalizer_bands.size());
+        std::copy_n(equalizer_state_.bands.begin(), active_equalizer_band_count, equalizer_bands.begin());
+        render_hazard_guard hazard_guard(render_hazard_);
+        do {
+            pipeline = decoded_pipeline_.load(std::memory_order_seq_cst);
+            render_hazard_.store(pipeline, std::memory_order_seq_cst);
+            if (decoded_pipeline_.load(std::memory_order_seq_cst) == pipeline) {
+                break;
             }
-
-            if (pending_seek_ms_.has_value()) {
-                seek_ms = pending_seek_ms_;
-                pending_seek_ms_.reset();
-            }
+            render_hazard_.store(nullptr, std::memory_order_seq_cst);
+        } while (true);
+        state_lock.unlock();
+        if (render_changed) {
+            decode_condition_.notify_all();
         }
 
-        if (source_uri.empty()) {
-            write_silence(buffer);
-            std::scoped_lock lock(mutex_);
-            state_.status = playback_status::idle;
-            state_.error_message.clear();
+        if (!should_play || !pipeline ||
+            pipeline->payload->frame_count != buffer.frame_count ||
+            !formats_match(pipeline->payload->format, buffer.format)) {
             return result<void>::success();
         }
 
-        if (!equalizer_configured_ || !formats_match(equalizer_format_, buffer.format)) {
-            configure_equalizer_for_format(buffer.format);
+        const std::size_t sample_count = static_cast<std::size_t>(buffer.frame_count) *
+            static_cast<std::size_t>(buffer.format.channel_count);
+
+        detail::playback::decoded_metadata metadata;
+        if (!pipeline->payload->queue.try_pop(
+                std::span<float>(pipeline->payload->render_scratch.data(), sample_count), metadata)) {
+            return result<void>::success();
         }
+        decode_condition_.notify_one();
 
-        if (should_open_decoder) {
-            auto open_result = open_decoder(source_uri, buffer.format);
-            if (!open_result) {
-                handle_source_error(open_result.error());
-                write_silence(buffer);
-                return result<void>::success();
-            }
-
-            std::scoped_lock lock(mutex_);
-            active_source_generation_ = generation;
-            decoder_ready_ = true;
-            state_.duration_ms = decoder_duration_ms();
-            state_.status = should_play ? playback_status::loading : playback_status::paused;
-        }
-
-        if (seek_ms.has_value()) {
-            auto seek_result = seek_decoder(*seek_ms);
-            if (!seek_result) {
-                handle_source_error(seek_result.error());
-                write_silence(buffer);
-                return result<void>::success();
-            }
-
-            equalizer_chain_.reset();
-        }
-
-        if (!should_play) {
-            write_silence(buffer);
-            std::scoped_lock lock(mutex_);
-            state_.status = reached_end_of_stream ? playback_status::idle : playback_status::paused;
-            state_.error_message.clear();
+        if (metadata.generation != requested_generation_atomic_.load(std::memory_order_acquire) ||
+            metadata.seek_sequence != requested_seek_sequence_atomic_.load(std::memory_order_acquire)) {
             return result<void>::success();
         }
 
-        auto decoded_result = read_decoder_frames(buffer.frame_count);
-        if (!decoded_result) {
-            handle_source_error(decoded_result.error());
-            write_silence(buffer);
-            return result<void>::success();
+        if (pipeline->payload->applied_equalizer_control_version != equalizer_control_version) {
+            pipeline->payload->equalizer.set_bands_precomputed(
+                std::span<const equalizer_band>(equalizer_bands.data(), active_equalizer_band_count),
+                equalizer_headroom_db);
+            pipeline->payload->equalizer.set_enabled(equalizer_enabled);
+            pipeline->payload->equalizer.set_output_gain_db(equalizer_output_gain_db);
+            pipeline->payload->equalizer.set_volume_linear(volume_percent_to_linear(volume_percent));
+            pipeline->payload->applied_equalizer_control_version = equalizer_control_version;
         }
-
-        apply_equalizer_runtime_targets(
-            equalizer_enabled,
-            equalizer_bands,
-            equalizer_output_gain_db,
-            volume_percent);
-        equalizer_chain_.process(decoded_result.value().samples.data(), buffer.frame_count);
+        pipeline->payload->equalizer.process(pipeline->payload->render_scratch.data(), buffer.frame_count);
 
         convert_float_to_buffer(
-            decoded_result.value().samples.data(),
+            pipeline->payload->render_scratch.data(),
             buffer.frame_count,
             buffer.format,
             buffer.bytes);
 
-        {
-            std::scoped_lock lock(mutex_);
-            state_.position_ms = decoded_result.value().position_ms;
-            state_.duration_ms = decoded_result.value().duration_ms;
+        std::unique_lock completion_lock(mutex_, std::try_to_lock);
+        if (completion_lock.owns_lock() && !shutting_down_ &&
+            metadata.generation == requested_source_generation_ &&
+            metadata.seek_sequence == requested_seek_sequence_) {
+            state_.position_ms = metadata.position_ms;
+            state_.duration_ms = metadata.duration_ms;
+            last_known_sample_rate_ = pipeline->payload->equalizer.sample_rate();
+            equalizer_state_.headroom_compensation_db =
+                pipeline->payload->equalizer.headroom_compensation_db();
             state_.status = playback_status::playing;
             state_.error_message.clear();
-            if (decoded_result.value().end_of_stream) {
+            if (metadata.end_of_stream) {
                 playback_intent_playing_ = false;
                 reached_end_of_stream_ = true;
                 state_.status = playback_status::idle;
@@ -813,12 +1046,14 @@ public:
                 state_.completion_token += 1;
             }
         }
-
         return result<void>::success();
     }
 
     void on_stream_error(const error& stream_error) {
         std::scoped_lock lock(mutex_);
+        if (shutting_down_) {
+            return;
+        }
         state_.device_lost = true;
         state_.active_output_device_id.clear();
         state_.active_output_device_name.clear();
@@ -840,6 +1075,27 @@ public:
     }
 
 private:
+    static result<void> invalid_finite_value_result(std::string operation) {
+        return result<void>::failure(make_error(
+            error_category::configuration,
+            error_code::invalid_argument,
+            std::move(operation),
+            "Equalizer values must be finite."));
+    }
+
+    template <typename T = void>
+    static result<T> closed_session_result(
+        std::string operation,
+        const error_category category = error_category::stream,
+        const error_code code = error_code::invalid_state,
+        std::string message = "Playback session is closed.") {
+        return result<T>::failure(make_error(
+            category,
+            code,
+            std::move(operation),
+            std::move(message)));
+    }
+
     class render_callback_adapter final : public render_callback {
     public:
         explicit render_callback_adapter(implementation& owner)
@@ -858,7 +1114,20 @@ private:
     };
 
     result<void> open_render_stream() {
-        auto handle_result = backend_->open_render_stream(config_.render, callback_);
+        render_stream_config render_config;
+        {
+            std::scoped_lock lock(mutex_);
+            if (shutting_down_) {
+                return result<void>::failure(make_error(
+                    error_category::stream,
+                    error_code::invalid_state,
+                    "playback_session::open_render_stream",
+                    "Playback session is closing."));
+            }
+            render_config = config_.render;
+        }
+
+        auto handle_result = backend_->open_render_stream(render_config, callback_);
         if (!handle_result) {
             return result<void>::failure(handle_result.error());
         }
@@ -868,11 +1137,22 @@ private:
         if (!start_result) {
             return start_result;
         }
-        refresh_active_output_device_state();
+        refresh_active_output_device_state(render_config.device);
         return result<void>::success();
     }
 
     result<void> reopen_render_stream() {
+        std::scoped_lock stream_lock(stream_operation_mutex_);
+        {
+            std::scoped_lock lock(mutex_);
+            if (shutting_down_) {
+                return result<void>::failure(make_error(
+                    error_category::stream,
+                    error_code::invalid_state,
+                    "playback_session::reopen_render_stream",
+                    "Playback session is closing."));
+            }
+        }
         auto close_result = render_stream_.close();
         if (!close_result && close_result.error().code != error_code::invalid_state) {
             return close_result;
@@ -896,6 +1176,9 @@ private:
             auto reopen_result = reopen_render_stream();
             if (!reopen_result) {
                 std::scoped_lock lock(mutex_);
+                if (shutting_down_) {
+                    return;
+                }
                 playback_intent_playing_ = false;
                 state_.status = playback_status::error;
                 state_.error_message = reopen_result.error().message;
@@ -905,16 +1188,263 @@ private:
         }
     }
 
-    void refresh_active_output_device_state() {
-        auto active_device_result = backend_->default_device(device_direction::render, config_.render.device.role);
-        if (config_.render.device.selection_mode == device_selector::mode::explicit_id) {
+    void decode_loop() {
+        std::uint64_t active_generation = 0;
+        std::uint64_t active_seek_sequence = 0;
+        audio_format active_format{};
+        std::uint32_t active_frame_count = 0;
+        bool end_of_stream = false;
+        bool request_failed = false;
+        std::uint64_t failed_generation = 0;
+        std::uint64_t failed_seek_sequence = 0;
+        audio_format failed_format{};
+        std::uint32_t failed_frame_count = 0;
+
+        while (true) {
+            std::string source_uri;
+            audio_format format{};
+            std::uint32_t frame_count = 0;
+            std::uint64_t generation = 0;
+            std::uint64_t seek_sequence = 0;
+            std::uint64_t decoder_epoch = 0;
+            std::optional<std::int64_t> seek_position;
+            decoded_pipeline* pipeline = nullptr;
+
+            {
+                std::unique_lock lock(mutex_);
+                decode_condition_.wait(lock, [&]() {
+                    const bool configured = !requested_source_uri_.empty() &&
+                        requested_render_format_.has_value() && requested_frame_count_ > 0;
+                    const auto* current_pipeline = decoded_pipeline_.load(std::memory_order_seq_cst);
+                    const bool failed_request_changed = !request_failed ||
+                        requested_source_generation_ != failed_generation ||
+                        requested_seek_sequence_ != failed_seek_sequence ||
+                        !formats_match(*requested_render_format_, failed_format) ||
+                        requested_frame_count_ != failed_frame_count;
+                    return shutting_down_ || (configured && failed_request_changed && (
+                        requested_source_generation_ != active_generation ||
+                        requested_seek_sequence_ != active_seek_sequence ||
+                        !formats_match(*requested_render_format_, active_format) ||
+                        requested_frame_count_ != active_frame_count ||
+                        (!end_of_stream && current_pipeline && !current_pipeline->payload->queue.full())));
+                });
+                if (shutting_down_) {
+                    return;
+                }
+                source_uri = requested_source_uri_;
+                format = *requested_render_format_;
+                frame_count = requested_frame_count_;
+                generation = requested_source_generation_;
+                seek_sequence = requested_seek_sequence_;
+                decoder_epoch = requested_decoder_epoch_;
+                seek_position = pending_seek_ms_;
+                pipeline = decoded_pipeline_.load(std::memory_order_seq_cst);
+            }
+
+            const bool needs_open = generation != active_generation ||
+                !formats_match(format, active_format) || frame_count != active_frame_count;
+            if (needs_open) {
+                {
+                    std::scoped_lock lock(mutex_);
+                    if (shutting_down_ || generation != requested_source_generation_ ||
+                        seek_sequence != requested_seek_sequence_) {
+                        continue;
+                    }
+                }
+                decoder_->close();
+                auto open_result = decoder_->open(source_uri, format, decoder_epoch);
+                if (!open_result) {
+                    std::scoped_lock lock(mutex_);
+                    if (!shutting_down_ && generation == requested_source_generation_) {
+                        handle_source_error_locked(open_result.error());
+                    }
+                    active_generation = generation;
+                    end_of_stream = true;
+                    request_failed = true;
+                    failed_generation = generation;
+                    failed_seek_sequence = seek_sequence;
+                    failed_format = format;
+                    failed_frame_count = frame_count;
+                    continue;
+                }
+                if (format.channel_count == 0U || frame_count >
+                        (std::numeric_limits<std::size_t>::max)() /
+                            static_cast<std::size_t>(format.channel_count)) {
+                    throw std::length_error("Decoded PCM slot size exceeds addressable memory.");
+                }
+                const std::size_t samples_per_slot = static_cast<std::size_t>(frame_count) *
+                    static_cast<std::size_t>(format.channel_count);
+                pipeline = prepare_pipeline_slot(samples_per_slot, format, frame_count);
+                publish_decoded_pipeline(pipeline);
+                active_generation = generation;
+                active_format = format;
+                active_frame_count = frame_count;
+                active_seek_sequence = 0;
+                end_of_stream = false;
+                request_failed = false;
+                {
+                    std::scoped_lock lock(mutex_);
+                    if (generation == requested_source_generation_) {
+                        decoder_ready_ = true;
+                        state_.duration_ms = decoder_->duration_ms();
+                    }
+                }
+            }
+
+            if (seek_sequence != active_seek_sequence) {
+                auto seek_result = decoder_->seek_to(
+                    seek_position.value_or(0), decoder_epoch);
+                if (!seek_result) {
+                    std::scoped_lock lock(mutex_);
+                    if (!shutting_down_ && generation == requested_source_generation_ &&
+                        seek_sequence == requested_seek_sequence_) {
+                        handle_source_error_locked(seek_result.error());
+                    }
+                    request_failed = true;
+                    failed_generation = generation;
+                    failed_seek_sequence = seek_sequence;
+                    failed_format = format;
+                    failed_frame_count = frame_count;
+                    continue;
+                }
+                const std::size_t samples_per_slot = static_cast<std::size_t>(frame_count) *
+                    static_cast<std::size_t>(format.channel_count);
+                pipeline = prepare_pipeline_slot(samples_per_slot, format, frame_count);
+                publish_decoded_pipeline(pipeline);
+                active_seek_sequence = seek_sequence;
+                end_of_stream = false;
+                request_failed = false;
+                std::scoped_lock lock(mutex_);
+                if (generation == requested_source_generation_ && seek_sequence == requested_seek_sequence_) {
+                    pending_seek_ms_.reset();
+                }
+            }
+
+            auto decoded_result = decoder_->read_frames(frame_count, decoder_epoch);
+            if (!decoded_result) {
+                std::scoped_lock lock(mutex_);
+                if (shutting_down_) {
+                    return;
+                }
+                if (generation != requested_source_generation_ ||
+                    seek_sequence != requested_seek_sequence_) {
+                    active_generation = 0;
+                    continue;
+                }
+                handle_source_error_locked(decoded_result.error());
+                end_of_stream = true;
+                request_failed = true;
+                failed_generation = generation;
+                failed_seek_sequence = seek_sequence;
+                failed_format = format;
+                failed_frame_count = frame_count;
+                continue;
+            }
+
+            {
+                std::scoped_lock lock(mutex_);
+                if (generation != requested_source_generation_ ||
+                    seek_sequence != requested_seek_sequence_) {
+                    active_generation = 0;
+                    continue;
+                }
+            }
+
+            auto block = std::move(decoded_result.value());
+            const detail::playback::decoded_metadata metadata{
+                .generation = generation,
+                .seek_sequence = seek_sequence,
+                .position_ms = block.position_ms,
+                .duration_ms = block.duration_ms,
+                .end_of_stream = block.end_of_stream,
+            };
+            if (pipeline->payload->queue.try_push(block.samples, metadata)) {
+                end_of_stream = block.end_of_stream;
+            }
+        }
+    }
+
+    void decode_worker_entry() noexcept {
+#if defined(_WIN32)
+        detail::win::com_scope com;
+        auto com_result = com.initialize_multithreaded();
+        if (!com_result) {
+            publish_decode_worker_exception(com_result.error().message);
+            return;
+        }
+#endif
+        try {
+            decode_loop();
+        } catch (const std::exception& exception) {
+            publish_decode_worker_exception(exception.what());
+        } catch (...) {
+            publish_decode_worker_exception("Unknown decode worker failure.");
+        }
+        // Release Media Foundation objects on the same COM-initialized worker
+        // before its apartment is uninitialized. External close after join is
+        // intentionally idempotent.
+        if (decoder_) {
+            decoder_->close();
+        }
+    }
+
+    void publish_decode_worker_exception(const std::string& message) noexcept {
+        try {
+            std::scoped_lock lock(mutex_);
+            if (shutting_down_) {
+                return;
+            }
+            playback_intent_playing_ = false;
+            decoder_ready_ = false;
+            state_.status = playback_status::error;
+            state_.error_message = message;
+            equalizer_state_.status = equalizer_status::error;
+            equalizer_state_.error_message = message;
+        } catch (...) {
+            // The worker boundary must never terminate the process while reporting an OOM.
+        }
+    }
+
+    decoded_pipeline* prepare_pipeline_slot(
+        const std::size_t samples_per_slot,
+        const audio_format& format,
+        const std::uint32_t frame_count) {
+        decoded_pipeline* published = decoded_pipeline_.load(std::memory_order_seq_cst);
+        decoded_pipeline* hazard = render_hazard_.load(std::memory_order_seq_cst);
+        for (auto& slot : pipeline_slots_) {
+            if (&slot != published && &slot != hazard) {
+                // With seq_cst publication/hazard operations, either this scan observes a
+                // validated callback hazard, or that callback's second current-pointer load
+                // observes the intervening publication and retries without touching payload.
+                slot.rebuild(samples_per_slot, format, frame_count);
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    void publish_decoded_pipeline(decoded_pipeline* pipeline) {
+        if (!pipeline) {
+            throw std::runtime_error("No free decoded pipeline slot is available.");
+        }
+        decoded_pipeline_.store(pipeline, std::memory_order_seq_cst);
+        std::scoped_lock lock(mutex_);
+        last_known_sample_rate_ = static_cast<float>(pipeline->payload->format.sample_rate);
+        recompute_equalizer_metadata_locked(last_known_sample_rate_);
+    }
+
+    void refresh_active_output_device_state(const device_selector& selector) {
+        auto active_device_result = backend_->default_device(
+            device_direction::render, selector.role);
+        if (selector.selection_mode == device_selector::mode::explicit_id) {
             auto devices_result = backend_->enumerate_devices(device_direction::render);
             if (devices_result) {
+                const std::string selected_device_id = selector.device_id;
                 const auto device_iterator = std::find_if(
                     devices_result.value().begin(),
                     devices_result.value().end(),
-                    [this](const device_info& device) {
-                        return device.id == config_.render.device.device_id;
+                    [&selected_device_id](const device_info& device) {
+                        return device.id == selected_device_id;
                     });
                 if (device_iterator != devices_result.value().end()) {
                     std::scoped_lock lock(mutex_);
@@ -1003,6 +1533,7 @@ private:
             equalizer_state_.status = equalizer_status::ready;
             equalizer_state_.error_message.clear();
         }
+        ++equalizer_control_version_;
     }
 
     [[nodiscard]] float current_sample_rate_or_default_locked() const {
@@ -1010,6 +1541,10 @@ private:
     }
 
     [[nodiscard]] std::optional<float> resolve_equalizer_sample_rate_locked() const {
+        const float callback_sample_rate = negotiated_sample_rate_atomic_.load(std::memory_order_acquire);
+        if (callback_sample_rate > 0.0F) {
+            return callback_sample_rate;
+        }
         std::scoped_lock lock(mutex_);
         if (state_.negotiated_format.has_value() && state_.negotiated_format->sample_rate > 0U) {
             return static_cast<float>(state_.negotiated_format->sample_rate);
@@ -1021,54 +1556,7 @@ private:
         return std::nullopt;
     }
 
-    void configure_equalizer_for_format(const audio_format& format) {
-        if (format.sample_rate == 0 || format.channel_count == 0) {
-            std::scoped_lock lock(mutex_);
-            equalizer_state_.status = equalizer_status::unsupported_audio_path;
-            equalizer_state_.error_message =
-                "Equalizer requires a negotiated render format with valid sample rate and channel count.";
-            equalizer_configured_ = false;
-            return;
-        }
-
-        equalizer_chain_.configure(
-            static_cast<float>(format.sample_rate),
-            static_cast<std::size_t>(format.channel_count));
-        equalizer_chain_.reset();
-        equalizer_format_ = format;
-        equalizer_configured_ = true;
-
-        std::scoped_lock lock(mutex_);
-        last_known_sample_rate_ = static_cast<float>(format.sample_rate);
-        recompute_equalizer_metadata_locked(last_known_sample_rate_);
-    }
-
-    void apply_equalizer_runtime_targets(
-        const bool enabled,
-        const std::span<const equalizer_band> bands,
-        const float output_gain_db,
-        const int volume_percent) {
-        if (!equalizer_configured_) {
-            return;
-        }
-
-        equalizer_chain_.set_bands(bands);
-        equalizer_chain_.set_enabled(enabled);
-        equalizer_chain_.set_output_gain_db(output_gain_db);
-        equalizer_chain_.set_volume_linear(volume_percent_to_linear(volume_percent));
-
-        std::scoped_lock lock(mutex_);
-        last_known_sample_rate_ = equalizer_chain_.sample_rate();
-        equalizer_state_.headroom_compensation_db = equalizer_chain_.headroom_compensation_db();
-        if (equalizer_state_.status != equalizer_status::audio_engine_unavailable &&
-            equalizer_state_.status != equalizer_status::unsupported_audio_path) {
-            equalizer_state_.status = equalizer_status::ready;
-            equalizer_state_.error_message.clear();
-        }
-    }
-
-    void handle_source_error(const error& source_error) {
-        std::scoped_lock lock(mutex_);
+    void handle_source_error_locked(const error& source_error) {
         playback_intent_playing_ = false;
         decoder_ready_ = false;
         reached_end_of_stream_ = false;
@@ -1076,89 +1564,43 @@ private:
         state_.error_message = source_error.message;
     }
 
-    std::int64_t decoder_duration_ms() const {
-#if defined(_WIN32)
-        return decoder_.duration_ms();
-#else
-        return 0;
-#endif
-    }
-
-    result<void> open_decoder(const std::string& source_uri, const audio_format& output_format) {
-#if defined(_WIN32)
-        return decoder_.open(source_uri, output_format);
-#else
-        (void)source_uri;
-        (void)output_format;
-        return result<void>::failure(make_error(
-            error_category::platform,
-            error_code::unsupported_platform,
-            "playback_session::open_decoder",
-            "Playback session decode is available only on Windows."));
-#endif
-    }
-
-    result<void> seek_decoder(const std::int64_t position_ms) {
-#if defined(_WIN32)
-        auto result_value = decoder_.seek_to(position_ms);
-        if (result_value) {
-            std::scoped_lock lock(mutex_);
-            state_.position_ms = position_ms;
-            state_.status = playback_intent_playing_ ? playback_status::loading : playback_status::paused;
-            state_.error_message.clear();
-        }
-        return result_value;
-#else
-        (void)position_ms;
-        return result<void>::failure(make_error(
-            error_category::platform,
-            error_code::unsupported_platform,
-            "playback_session::seek_decoder",
-            "Playback session decode is available only on Windows."));
-#endif
-    }
-
-    decoded_audio_block_result read_decoder_frames(const std::uint32_t frame_count) {
-#if defined(_WIN32)
-        return decoder_.read_frames(frame_count);
-#else
-        (void)frame_count;
-        return decoded_audio_block_result::failure(make_error(
-            error_category::platform,
-            error_code::unsupported_platform,
-            "playback_session::read_decoder_frames",
-            "Playback session decode is available only on Windows."));
-#endif
-    }
-
     std::shared_ptr<detail::runtime_backend> backend_;
     playback_session_config config_;
     render_callback_adapter callback_;
     render_stream render_stream_;
     mutable std::mutex mutex_;
+    std::mutex stream_operation_mutex_;
+    std::mutex decoder_command_mutex_;
     std::condition_variable recovery_condition_;
+    std::condition_variable decode_condition_;
     std::thread recovery_thread_;
+    std::thread decode_thread_;
     playback_state state_{};
     sonotide::equalizer_state equalizer_state_{};
-    detail::dsp::equalizer_chain equalizer_chain_;
     detail::dsp::output_headroom_controller headroom_controller_;
     std::vector<equalizer_preset> available_equalizer_presets_ = detail::dsp::builtin_equalizer_presets();
-    audio_format equalizer_format_{};
     float last_known_sample_rate_ = 0.0F;
+    std::atomic<float> negotiated_sample_rate_atomic_{0.0F};
     bool playback_intent_playing_ = false;
+    std::uint64_t equalizer_control_version_ = 0;
     bool decoder_ready_ = false;
-    bool equalizer_configured_ = false;
     bool recovery_requested_ = false;
     bool shutting_down_ = false;
     bool closed_ = false;
     bool reached_end_of_stream_ = false;
     std::uint64_t requested_source_generation_ = 0;
-    std::uint64_t active_source_generation_ = 0;
+    std::atomic<std::uint64_t> requested_generation_atomic_{0};
+    std::uint64_t requested_seek_sequence_ = 0;
+    std::uint64_t requested_decoder_epoch_ = 0;
+    std::atomic<std::uint64_t> requested_seek_sequence_atomic_{0};
     std::optional<std::int64_t> pending_seek_ms_;
     std::string requested_source_uri_;
-#if defined(_WIN32)
-    detail::win::media_foundation_decoder decoder_;
-#endif
+    std::optional<audio_format> requested_render_format_;
+    std::uint32_t requested_frame_count_ = 0;
+    std::array<decoded_pipeline, 3> pipeline_slots_;
+    std::atomic<decoded_pipeline*> decoded_pipeline_{nullptr};
+    std::atomic<decoded_pipeline*> render_hazard_{nullptr};
+    std::unique_ptr<detail::playback::decoder> decoder_;
 };
 
 result<playback_session> playback_session::create(
@@ -1167,268 +1609,314 @@ result<playback_session> playback_session::create(
     return implementation::create(std::move(backend), config);
 }
 
-playback_session::playback_session(std::unique_ptr<implementation> implementation) noexcept
+playback_session::playback_session(std::shared_ptr<implementation> implementation) noexcept
     : implementation_(std::move(implementation)) {}
 
-playback_session::~playback_session() = default;
+playback_session::~playback_session() {
+    auto implementation = implementation_.exchange(nullptr);
+    if (implementation) {
+        try {
+            (void)implementation->close();
+        } catch (...) {
+            // Destructors cannot surface cleanup exceptions.
+        }
+    }
+}
 
-playback_session::playback_session(playback_session&&) noexcept = default;
+playback_session::playback_session(playback_session&& other) noexcept
+    : implementation_(other.implementation_.exchange(nullptr)) {}
 
-playback_session& playback_session::operator=(playback_session&&) noexcept = default;
+playback_session& playback_session::operator=(playback_session&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    auto replacement = other.implementation_.exchange(nullptr);
+    auto previous = implementation_.exchange(std::move(replacement));
+    if (previous) {
+        try {
+            (void)previous->close();
+        } catch (...) {
+            // noexcept move assignment cannot surface cleanup exceptions.
+        }
+    }
+    return *this;
+}
 
 bool playback_session::is_open() const noexcept {
-    return implementation_ != nullptr && implementation_->is_open();
+    auto implementation = implementation_.load();
+    return implementation && implementation->is_open();
 }
 
 result<void> playback_session::load(std::string source_uri) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::load",
             "Playback session is not open."));
     }
-    return implementation_->load(std::move(source_uri));
+    return implementation->load(std::move(source_uri));
 }
 
 result<void> playback_session::play() {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::play",
             "Playback session is not open."));
     }
-    return implementation_->play();
+    return implementation->play();
 }
 
 result<void> playback_session::pause() {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::pause",
             "Playback session is not open."));
     }
-    return implementation_->pause();
+    return implementation->pause();
 }
 
 result<void> playback_session::seek_to(const std::int64_t position_ms) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::seek_to",
             "Playback session is not open."));
     }
-    return implementation_->seek_to(position_ms);
+    return implementation->seek_to(position_ms);
 }
 
 result<void> playback_session::set_volume_percent(const int volume_percent) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_volume_percent",
             "Playback session is not open."));
     }
-    return implementation_->set_volume_percent(volume_percent);
+    return implementation->set_volume_percent(volume_percent);
 }
 
 result<void> playback_session::set_equalizer_enabled(const bool enabled) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_equalizer_enabled",
             "Playback session is not open."));
     }
-    return implementation_->set_equalizer_enabled(enabled);
+    return implementation->set_equalizer_enabled(enabled);
 }
 
 result<void> playback_session::select_equalizer_preset(const equalizer_preset_id preset_id) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::select_equalizer_preset",
             "Playback session is not open."));
     }
-    return implementation_->select_equalizer_preset(preset_id);
+    return implementation->select_equalizer_preset(preset_id);
 }
 
 result<void> playback_session::set_equalizer_band_gain(
     const std::size_t band_index,
     const float gain_db) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_equalizer_band_gain",
             "Playback session is not open."));
     }
-    return implementation_->set_equalizer_band_gain(band_index, gain_db);
+    return implementation->set_equalizer_band_gain(band_index, gain_db);
 }
 
 result<void> playback_session::set_equalizer_band_q(
     const std::size_t band_index,
     const float q_value) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_equalizer_band_q",
             "Playback session is not open."));
     }
-    return implementation_->set_equalizer_band_q(band_index, q_value);
+    return implementation->set_equalizer_band_q(band_index, q_value);
 }
 
 result<void> playback_session::add_equalizer_band(
     const float center_frequency_hz,
     const float gain_db) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::add_equalizer_band",
             "Playback session is not open."));
     }
-    return implementation_->add_equalizer_band(center_frequency_hz, gain_db);
+    return implementation->add_equalizer_band(center_frequency_hz, gain_db);
 }
 
 result<void> playback_session::remove_equalizer_band(const std::size_t band_index) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::remove_equalizer_band",
             "Playback session is not open."));
     }
-    return implementation_->remove_equalizer_band(band_index);
+    return implementation->remove_equalizer_band(band_index);
 }
 
 result<void> playback_session::set_equalizer_band_frequency(
     const std::size_t band_index,
     const float center_frequency_hz) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_equalizer_band_frequency",
             "Playback session is not open."));
     }
-    return implementation_->set_equalizer_band_frequency(band_index, center_frequency_hz);
+    return implementation->set_equalizer_band_frequency(band_index, center_frequency_hz);
 }
 
 result<void> playback_session::reset_equalizer() {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::reset_equalizer",
             "Playback session is not open."));
     }
-    return implementation_->reset_equalizer();
+    return implementation->reset_equalizer();
 }
 
 result<void> playback_session::set_equalizer_output_gain(const float output_gain_db) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::set_equalizer_output_gain",
             "Playback session is not open."));
     }
-    return implementation_->set_equalizer_output_gain(output_gain_db);
+    return implementation->set_equalizer_output_gain(output_gain_db);
 }
 
 result<void> playback_session::apply_equalizer_state(const sonotide::equalizer_state& state) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::apply_equalizer_state",
             "Playback session is not open."));
     }
-    return implementation_->apply_equalizer_state(state);
+    return implementation->apply_equalizer_state(state);
 }
 
 result<std::vector<device_info>> playback_session::list_output_devices() const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<std::vector<device_info>>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::list_output_devices",
             "Playback session is not open."));
     }
-    return implementation_->list_output_devices();
+    return implementation->list_output_devices();
 }
 
 result<void> playback_session::select_output_device(std::string device_id) {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<void>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::select_output_device",
             "Playback session is not open."));
     }
-    return implementation_->select_output_device(std::move(device_id));
+    return implementation->select_output_device(std::move(device_id));
 }
 
 playback_state playback_session::state() const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return {};
     }
-    return implementation_->state();
+    return implementation->state();
 }
 
 sonotide::equalizer_state playback_session::equalizer_state() const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return {};
     }
-    return implementation_->equalizer_state();
+    return implementation->equalizer_state();
 }
 
 result<sonotide::equalizer_response_curve> playback_session::sample_equalizer_response(
     const std::span<const float> frequencies_hz) const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<sonotide::equalizer_response_curve>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::sample_equalizer_response",
             "Playback session is not open."));
     }
-    return implementation_->sample_equalizer_response(frequencies_hz);
+    return implementation->sample_equalizer_response(frequencies_hz);
 }
 
 result<sonotide::equalizer_response_curve> playback_session::preview_equalizer_response(
     const equalizer_preview_state& preview_state,
     const std::span<const float> frequencies_hz) const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return result<sonotide::equalizer_response_curve>::failure(make_error(
             error_category::stream,
             error_code::invalid_state,
             "playback_session::preview_equalizer_response",
             "Playback session is not open."));
     }
-    return implementation_->preview_equalizer_response(preview_state, frequencies_hz);
+    return implementation->preview_equalizer_response(preview_state, frequencies_hz);
 }
 
 std::optional<sonotide::equalizer_frequency_range> playback_session::equalizer_band_frequency_range(
     const std::size_t band_index) const {
-    if (!implementation_) {
+    auto implementation = implementation_.load();
+    if (!implementation) {
         return std::nullopt;
     }
-    return implementation_->equalizer_band_frequency_range(band_index);
+    return implementation->equalizer_band_frequency_range(band_index);
 }
 
 result<void> playback_session::close() {
-    if (!implementation_) {
+    auto implementation = implementation_.exchange(nullptr);
+    if (!implementation) {
         return result<void>::success();
     }
-    auto close_result = implementation_->close();
-    implementation_.reset();
-    return close_result;
+    return implementation->close();
 }
 
 }  // namespace sonotide

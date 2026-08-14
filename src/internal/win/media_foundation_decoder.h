@@ -7,11 +7,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "sonotide/audio_format.h"
 #include "sonotide/result.h"
+#include "internal/win/media_foundation_decoder_validation.h"
 
 namespace sonotide::detail::win {
 
@@ -34,14 +36,21 @@ public:
     media_foundation_decoder() = default;
 
     /// Открывает источник и конфигурирует output format под render path.
-    [[nodiscard]] result<void> open(const std::string& source_uri, const audio_format& output_format);
+    [[nodiscard]] result<void> open(
+        const std::string& source_uri,
+        const audio_format& output_format,
+        std::uint64_t command_epoch);
     /// Выполняет seek в текущем source reader.
-    [[nodiscard]] result<void> seek_to(std::int64_t position_ms);
+    [[nodiscard]] result<void> seek_to(std::int64_t position_ms, std::uint64_t command_epoch);
     /// Возвращает очередной блок PCM, декодируя дополнительные sample-ы по необходимости.
-    [[nodiscard]] result<decoded_audio_block> read_frames(std::uint32_t frame_count);
+    [[nodiscard]] result<decoded_audio_block> read_frames(
+        std::uint32_t frame_count,
+        std::uint64_t command_epoch);
 
     /// Полностью освобождает source reader и промежуточные буферы.
     void close();
+    /// Прерывает потенциально блокирующее чтение при shutdown decode worker.
+    [[nodiscard]] std::uint64_t request_cancel() noexcept;
 
     /// Сообщает, открыт ли сейчас source reader.
     [[nodiscard]] bool is_open() const noexcept;
@@ -52,10 +61,16 @@ public:
 
 private:
     /// Гарантирует наличие достаточного числа decoded sample-ов в буфере.
-    [[nodiscard]] result<void> ensure_decoded_frames(std::uint32_t frame_count);
+    [[nodiscard]] result<void> ensure_decoded_frames(
+        std::uint32_t frame_count,
+        std::uint64_t cancellation_epoch);
 
     /// Source reader Media Foundation, которым владеет декодер.
+    /// Любое копирование/публикация/reset выполняются под `source_reader_mutex_`:
+    /// локальный ComPtr удерживает COM-объект живым во время ReadSample/Flush.
+    mutable std::mutex source_reader_mutex_;
     Microsoft::WRL::ComPtr<IMFSourceReader> source_reader_;
+    decoder_cancellation_epoch cancellation_;
     /// Выходной формат, под который настраивался `source_reader_`.
     audio_format output_format_{};
     /// Буфер уже прочитанных float sample-ов.

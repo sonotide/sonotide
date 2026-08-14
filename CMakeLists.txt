@@ -35,6 +35,7 @@ add_library(sonotide STATIC
     src/render_stream.cpp
     src/loopback_capture_stream.cpp
     src/internal/state_machine.cpp
+    src/internal/playback/playback_decoder.cpp
     src/internal/dsp/parameter_smoother.cpp
     src/internal/dsp/biquad_filter.cpp
     src/internal/dsp/equalizer_response_sampler.cpp

@@ -84,6 +84,10 @@ void equalizer_chain::configure(const float sample_rate, const std::size_t chann
     current_band_gains_db_ = target_band_gains_db_;
 }
 
+void equalizer_chain::prepare(const std::size_t max_frame_count) {
+    dry_scratch_.reserve(max_frame_count * channel_count_);
+}
+
 /// Очищает историю фильтров, сохраняя целевые настройки.
 void equalizer_chain::reset() {
     for (biquad_filter& filter : filters_) {
@@ -100,6 +104,14 @@ void equalizer_chain::set_enabled(const bool enabled) {
 
 /// Обновляет желаемую раскладку полос EQ.
 void equalizer_chain::set_bands(const std::span<const equalizer_band> bands) {
+    set_bands_precomputed(
+        bands,
+        headroom_controller_.compute_target_preamp_db(bands, sample_rate_));
+}
+
+void equalizer_chain::set_bands_precomputed(
+    const std::span<const equalizer_band> bands,
+    const float headroom_compensation_db) {
     const std::size_t ramp_samples = ramp_samples_for_rate(sample_rate_);
     active_band_count_ = (std::min)(bands.size(), static_cast<std::size_t>(equalizer_max_band_count));
     const std::span<const equalizer_band> active_bands = bands.first(active_band_count_);
@@ -123,8 +135,7 @@ void equalizer_chain::set_bands(const std::span<const equalizer_band> bands) {
         current_band_q_values_[band_index] = default_equalizer_q_value;
     }
 
-    headroom_compensation_db_ =
-        headroom_controller_.compute_target_preamp_db(active_bands, sample_rate_);
+    headroom_compensation_db_ = headroom_compensation_db;
 
     preamp_smoother_.set_target(headroom_compensation_db_, ramp_samples);
 }
@@ -147,10 +158,13 @@ void equalizer_chain::process(float* interleaved_samples, const std::size_t fram
         return;
     }
 
-    /// Копия исходного сигнала нужна, потому что обработанный путь смешивается с оригинальными отсчётами.
-    std::vector<float> dry_copy(
-        interleaved_samples,
-        interleaved_samples + frame_count * channel_count_);
+    const std::size_t sample_count = frame_count * channel_count_;
+    if (sample_count > dry_scratch_.capacity()) {
+        // `prepare` is mandatory before the realtime path; fail closed instead of allocating.
+        return;
+    }
+    dry_scratch_.resize(sample_count);
+    std::copy_n(interleaved_samples, sample_count, dry_scratch_.data());
 
     for (std::size_t frame_offset = 0; frame_offset < frame_count; frame_offset += kControlBlockFrames) {
         /// Коэффициенты обновляются порциями размера контрольного блока, а не на каждом отсчёте.
@@ -159,7 +173,7 @@ void equalizer_chain::process(float* interleaved_samples, const std::size_t fram
 
         /// Каждый контрольный блок работает на соответствующем поддиапазоне буфера, обрабатываемого на месте.
         float* processed_block = interleaved_samples + frame_offset * channel_count_;
-        const float* dry_block = dry_copy.data() + frame_offset * channel_count_;
+        const float* dry_block = dry_scratch_.data() + frame_offset * channel_count_;
 
         for (std::size_t band_index = 0; band_index < active_band_count_; ++band_index) {
             /// Все полосы проходят последовательно через один и тот же блок, поэтому кривая накапливается.

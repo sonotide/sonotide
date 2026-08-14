@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <utility>
 
 #include "internal/equalizer_layout_utils.h"
 #include "internal/dsp/equalizer_response_sampler.h"
@@ -55,7 +56,25 @@ float interpolate_default_band_frequency(
 }
 
 float clamp_equalizer_gain_db(const float gain_db) {
+    if (!std::isfinite(gain_db)) {
+        return 0.0F;
+    }
     return (std::clamp)(gain_db, -12.0F, 12.0F);
+}
+
+bool is_finite_band(const equalizer_band& band) noexcept {
+    return std::isfinite(band.center_frequency_hz) &&
+           std::isfinite(band.gain_db) &&
+           std::isfinite(band.q_value);
+}
+
+result<equalizer_response_curve> invalid_response_argument(std::string message) {
+    error failure;
+    failure.category = error_category::configuration;
+    failure.code = error_code::invalid_argument;
+    failure.operation = "sample_equalizer_response";
+    failure.message = std::move(message);
+    return result<equalizer_response_curve>::failure(std::move(failure));
 }
 
 }  // namespace
@@ -98,6 +117,9 @@ std::optional<equalizer_frequency_range> equalizer_band_editable_frequency_range
     if (band_index >= bands.size()) {
         return std::nullopt;
     }
+    if (!std::all_of(bands.begin(), bands.end(), is_finite_band)) {
+        return std::nullopt;
+    }
 
     const equalizer_frequency_limits frequency_limits = supported_equalizer_frequency_limits();
     float min_frequency_hz = frequency_limits.min_frequency_hz;
@@ -128,33 +150,27 @@ result<equalizer_response_curve> sample_equalizer_response(
     const equalizer_state& state,
     const float sample_rate_hz,
     const std::span<const float> frequencies_hz) {
-    if (sample_rate_hz <= 0.0F) {
-        error failure;
-        failure.category = error_category::configuration;
-        failure.code = error_code::invalid_argument;
-        failure.operation = "sample_equalizer_response";
-        failure.message = "Sample rate must be greater than zero.";
-        return result<equalizer_response_curve>::failure(std::move(failure));
+    if (!std::isfinite(sample_rate_hz) || sample_rate_hz <= 0.0F) {
+        return invalid_response_argument("Sample rate must be finite and greater than zero.");
     }
     if (frequencies_hz.empty()) {
-        error failure;
-        failure.category = error_category::configuration;
-        failure.code = error_code::invalid_argument;
-        failure.operation = "sample_equalizer_response";
-        failure.message = "At least one frequency point is required to sample the equalizer response.";
-        return result<equalizer_response_curve>::failure(std::move(failure));
+        return invalid_response_argument(
+            "At least one frequency point is required to sample the equalizer response.");
+    }
+    if (!std::isfinite(state.output_gain_db)) {
+        return invalid_response_argument("Equalizer output gain must be finite.");
+    }
+    if (!std::all_of(state.bands.begin(), state.bands.end(), is_finite_band)) {
+        return invalid_response_argument(
+            "Equalizer band frequency, gain, and Q values must be finite.");
     }
 
     const float nyquist_frequency_hz = sample_rate_hz * 0.5F;
     for (const float frequency_hz : frequencies_hz) {
-        if (frequency_hz <= 0.0F || frequency_hz > nyquist_frequency_hz) {
-            error failure;
-            failure.category = error_category::configuration;
-            failure.code = error_code::invalid_argument;
-            failure.operation = "sample_equalizer_response";
-            failure.message =
-                "Requested response frequency must be greater than zero and not exceed Nyquist.";
-            return result<equalizer_response_curve>::failure(std::move(failure));
+        if (!std::isfinite(frequency_hz) || frequency_hz <= 0.0F ||
+            frequency_hz > nyquist_frequency_hz) {
+            return invalid_response_argument(
+                "Requested response frequency must be finite, greater than zero, and not exceed Nyquist.");
         }
     }
 
