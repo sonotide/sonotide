@@ -1,6 +1,10 @@
 @PACKAGE_INIT@
 
+set(Sonotide_VERSION "@PROJECT_VERSION@")
+set(Sonotide_VERSION_MAJOR "@PROJECT_VERSION_MAJOR@")
+set(Sonotide_VERSION_MINOR "@PROJECT_VERSION_MINOR@")
+set(Sonotide_VERSION_PATCH "@PROJECT_VERSION_PATCH@")
+
 include("${CMAKE_CURRENT_LIST_DIR}/SonotideTargets.cmake")
 
 check_required_components(Sonotide)
-

@@ -21,7 +21,8 @@
         "CMAKE_VS_GLOBALS": "VcpkgEnabled=false",
         "SONOTIDE_BUILD_EXAMPLES": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SONOTIDE_BUILD_TESTS": "ON"
+        "SONOTIDE_BUILD_TESTS": "ON",
+        "SONOTIDE_WARNINGS_AS_ERRORS": "ON"
       }
     },
     {
@@ -39,7 +40,8 @@
         "CMAKE_VS_GLOBALS": "VcpkgEnabled=false",
         "SONOTIDE_BUILD_EXAMPLES": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SONOTIDE_BUILD_TESTS": "ON"
+        "SONOTIDE_BUILD_TESTS": "ON",
+        "SONOTIDE_WARNINGS_AS_ERRORS": "ON"
       }
     },
     {
@@ -53,7 +55,8 @@
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/ci-ninja-debug",
         "SONOTIDE_BUILD_EXAMPLES": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SONOTIDE_BUILD_TESTS": "ON"
+        "SONOTIDE_BUILD_TESTS": "ON",
+        "SONOTIDE_WARNINGS_AS_ERRORS": "ON"
       }
     },
     {
@@ -67,7 +70,23 @@
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/ci-ninja-release",
         "SONOTIDE_BUILD_EXAMPLES": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SONOTIDE_BUILD_TESTS": "ON"
+        "SONOTIDE_BUILD_TESTS": "ON",
+        "SONOTIDE_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "ci-ninja-asan",
+      "displayName": "CI Ninja MSVC AddressSanitizer",
+      "description": "Build and test Sonotide with the MSVC AddressSanitizer runtime.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ci-ninja-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/ci-ninja-asan",
+        "SONOTIDE_BUILD_EXAMPLES": "OFF",
+        "SONOTIDE_BUILD_TESTS": "ON",
+        "SONOTIDE_WARNINGS_AS_ERRORS": "ON",
+        "SONOTIDE_ENABLE_ADDRESS_SANITIZER": "ON"
       }
     }
   ],
@@ -97,6 +116,12 @@
       "displayName": "Build CI Ninja Release",
       "description": "Build Sonotide with the CI Ninja Release configure preset.",
       "configurePreset": "ci-ninja-release"
+    },
+    {
+      "name": "ci-ninja-asan",
+      "displayName": "Build CI Ninja MSVC AddressSanitizer",
+      "description": "Build the AddressSanitizer validation configuration.",
+      "configurePreset": "ci-ninja-asan"
     }
   ],
   "testPresets": [
@@ -134,6 +159,15 @@
       "displayName": "Test CI Ninja Release",
       "description": "Run Sonotide tests from the CI Ninja Release build tree.",
       "configurePreset": "ci-ninja-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci-ninja-asan",
+      "displayName": "Test CI Ninja MSVC AddressSanitizer",
+      "description": "Run tests with MSVC AddressSanitizer instrumentation.",
+      "configurePreset": "ci-ninja-asan",
       "output": {
         "outputOnFailure": true
       }

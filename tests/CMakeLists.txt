@@ -71,3 +71,21 @@ set_tests_properties(
 if(WIN32)
     set_tests_properties(sonotide_win_validation_tests PROPERTIES TIMEOUT 30)
 endif()
+
+if(SONOTIDE_ENABLE_ADDRESS_SANITIZER)
+    set(SONOTIDE_ASAN_TEST_TARGETS
+        sonotide_result_tests
+        sonotide_state_machine_tests
+        sonotide_equalizer_tests
+        sonotide_dsp_tests
+        sonotide_stream_wrapper_tests
+        sonotide_playback_session_tests
+        sonotide_runtime_tests)
+    if(WIN32)
+        list(APPEND SONOTIDE_ASAN_TEST_TARGETS sonotide_win_validation_tests)
+    endif()
+
+    foreach(test_target IN LISTS SONOTIDE_ASAN_TEST_TARGETS)
+        sonotide_copy_asan_runtime(${test_target})
+    endforeach()
+endif()

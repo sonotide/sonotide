@@ -43,6 +43,10 @@ int main(int argc, char** argv) {
                   << std::flush;
         if (state.status == sonotide::playback_status::idle ||
             state.status == sonotide::playback_status::error) {
+            if (state.status == sonotide::playback_status::error) {
+                std::cerr << "Playback failed: " << state.error_message << '\n';
+                return 1;
+            }
             break;
         }
 
@@ -53,6 +57,12 @@ int main(int argc, char** argv) {
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    auto close_result = session_result.value().close();
+    if (!close_result) {
+        std::cerr << close_result.error().message << '\n';
+        return 1;
     }
 
     return 0;

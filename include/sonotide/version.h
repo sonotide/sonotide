@@ -9,8 +9,8 @@ inline constexpr int version_major = 0;
 /// Минорная версия пакета Sonotide.
 inline constexpr int version_minor = 4;
 /// Патч-версия пакета Sonotide.
-inline constexpr int version_patch = 0;
+inline constexpr int version_patch = 1;
 /// Человекочитаемая semantic version строка.
-inline constexpr std::string_view version_string = "0.4.0";
+inline constexpr std::string_view version_string = "0.4.1";
 
 }  // namespace sonotide

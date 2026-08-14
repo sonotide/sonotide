@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <iostream>
+#include <thread>
 
 #include "sonotide/runtime.h"
 
@@ -41,10 +43,23 @@ int main() {
         return 1;
     }
 
-    // Если start() прошёл, то критический путь рендеринга уже подтверждён.
+    // Держим поток открытым достаточно долго, чтобы worker действительно вызвал callback.
     auto start_result = stream_result.value().start();
     if (!start_result) {
         std::cerr << start_result.error().message << '\n';
+        return 1;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    const auto status = stream_result.value().status();
+    if (status.statistics.callback_count == 0) {
+        std::cerr << "The render callback was not invoked.\n";
+        return 1;
+    }
+
+    auto close_result = stream_result.value().close();
+    if (!close_result) {
+        std::cerr << close_result.error().message << '\n';
         return 1;
     }
 
