@@ -95,7 +95,7 @@ public:
 
     /// Возвращает сохранённую ошибку. Вызывать только когда `has_value()` равно `false`.
     [[nodiscard]] const sonotide::error& error() const& {
-        return *error_;
+        return error_.value();
     }
 
 private:

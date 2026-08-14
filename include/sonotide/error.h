@@ -53,6 +53,8 @@ enum class error_code {
     platform_failure,
     /// Возможность ещё не реализована.
     not_implemented,
+    /// Операция не завершилась за заданное ограниченное время.
+    operation_timed_out,
 };
 
 /// Подробный объект ошибки, возвращаемый операциями Sonotide.

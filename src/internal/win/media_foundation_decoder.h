@@ -48,8 +48,8 @@ public:
         std::uint64_t command_epoch);
 
     /// Полностью освобождает source reader и промежуточные буферы.
-    void close();
-    /// Прерывает потенциально блокирующее чтение при shutdown decode worker.
+    void close() noexcept;
+    /// Неблокирующе инвалидирует текущую decode-команду.
     [[nodiscard]] std::uint64_t request_cancel() noexcept;
 
     /// Сообщает, открыт ли сейчас source reader.

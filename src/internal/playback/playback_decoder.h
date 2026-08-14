@@ -30,6 +30,7 @@ public:
         std::uint32_t frame_count,
         std::uint64_t command_epoch) = 0;
     /// Cancels the previous command and returns the epoch owned by the next command.
+    /// Implementations must be thread-safe, noexcept, and non-blocking.
     [[nodiscard]] virtual std::uint64_t request_cancel() noexcept = 0;
     virtual void close() noexcept = 0;
     [[nodiscard]] virtual std::int64_t duration_ms() const noexcept = 0;

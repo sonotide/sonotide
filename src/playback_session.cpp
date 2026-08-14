@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,7 @@ float volume_percent_to_linear(const int volume_percent) {
 
 constexpr float kMinEqualizerGainDb = -12.0F;
 constexpr float kMaxEqualizerGainDb = 12.0F;
+constexpr std::uint32_t kMaximumDecoderShutdownTimeoutMs = 5000U;
 
 float clamp_equalizer_gain_db(const float gain_db) {
     return (std::clamp)(gain_db, kMinEqualizerGainDb, kMaxEqualizerGainDb);
@@ -255,6 +257,14 @@ public:
     static result<playback_session> create(
         std::shared_ptr<detail::runtime_backend> backend,
         const playback_session_config& config) {
+        if (config.decoder_shutdown_timeout_ms == 0U ||
+            config.decoder_shutdown_timeout_ms > kMaximumDecoderShutdownTimeoutMs) {
+            return result<playback_session>::failure(make_error(
+                error_category::configuration,
+                error_code::invalid_argument,
+                "playback_session::create",
+                "Decoder shutdown timeout must be between 1 and 5000 milliseconds."));
+        }
         if (config.initial_equalizer_state.has_value()) {
             const auto& initial = *config.initial_equalizer_state;
             const bool invalid = initial.bands.size() > supported_equalizer_band_count_limits().max_band_count ||
@@ -289,7 +299,10 @@ public:
             instance->recovery_thread_ = std::thread([owner = instance.get()]() {
                 owner->recovery_loop();
             });
-            instance->decode_thread_ = std::thread([owner = instance.get()]() {
+            // The decode worker may outlive logical close() when an external
+            // synchronous Media Foundation handler does not return. Shared
+            // ownership keeps every object it can touch alive in that case.
+            instance->decode_thread_ = std::thread([owner = instance]() {
                 owner->decode_worker_entry();
             });
         } catch (const std::exception& exception) {
@@ -374,13 +387,7 @@ public:
             if (closed_) {
                 return closed_session_result("playback_session::load");
             }
-        }
-        const std::uint64_t command_epoch = decoder_->request_cancel();
-        {
-            std::scoped_lock lock(mutex_);
-            if (closed_) {
-                return closed_session_result("playback_session::load");
-            }
+            const std::uint64_t command_epoch = decoder_->request_cancel();
             requested_source_uri_ = std::move(source_uri);
             ++requested_source_generation_;
             requested_decoder_epoch_ = command_epoch;
@@ -461,13 +468,7 @@ public:
                     "playback_session::seek_to",
                     "Cannot seek before a source has been loaded."));
             }
-        }
-        const std::uint64_t command_epoch = decoder_->request_cancel();
-        {
-            std::scoped_lock lock(mutex_);
-            if (closed_ || requested_source_uri_.empty()) {
-                return closed_session_result("playback_session::seek_to");
-            }
+            const std::uint64_t command_epoch = decoder_->request_cancel();
             pending_seek_ms_ = (std::max)(position_ms, static_cast<std::int64_t>(0));
             ++requested_seek_sequence_;
             requested_decoder_epoch_ = command_epoch;
@@ -774,13 +775,7 @@ public:
             if (closed_) {
                 return closed_session_result("playback_session::select_output_device");
             }
-        }
-        const std::uint64_t command_epoch = decoder_->request_cancel();
-        {
-            std::scoped_lock lock(mutex_);
-            if (closed_) {
-                return closed_session_result("playback_session::select_output_device");
-            }
+            const std::uint64_t command_epoch = decoder_->request_cancel();
             config_.render.device = device_id.empty()
                 ? device_selector::system_default(device_direction::render)
                 : device_selector::explicit_id(device_direction::render, std::move(device_id));
@@ -904,6 +899,7 @@ public:
 
     result<void> close() {
         std::scoped_lock command_lock(decoder_command_mutex_);
+        std::uint32_t decoder_shutdown_timeout_ms = 0;
         {
             std::scoped_lock lock(mutex_);
             if (closed_) {
@@ -912,16 +908,33 @@ public:
             closed_ = true;
             shutting_down_ = true;
             recovery_requested_ = false;
+            decoder_shutdown_timeout_ms = config_.decoder_shutdown_timeout_ms;
+            if (decoder_) {
+                (void)decoder_->request_cancel();
+            }
             recovery_condition_.notify_all();
             decode_condition_.notify_all();
         }
 
-        if (decoder_) {
-            (void)decoder_->request_cancel();
-        }
-
+        bool decode_shutdown_timed_out = false;
         if (decode_thread_.joinable()) {
-            decode_thread_.join();
+            bool decode_worker_finished = false;
+            {
+                std::unique_lock lock(mutex_);
+                decode_worker_finished = decode_worker_finished_condition_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(decoder_shutdown_timeout_ms),
+                    [this]() { return decode_worker_finished_; });
+            }
+            if (decode_worker_finished) {
+                decode_thread_.join();
+            } else {
+                decode_shutdown_timed_out = true;
+                // std::thread has no timed join. The worker owns this
+                // implementation and releases its decoder on its own COM
+                // apartment if the external synchronous operation returns.
+                decode_thread_.detach();
+            }
         }
 
         if (recovery_thread_.joinable()) {
@@ -934,8 +947,16 @@ public:
         while (render_hazard_.load(std::memory_order_seq_cst) != nullptr) {
             std::this_thread::yield();
         }
-        if (decoder_) {
-            decoder_->close();
+        if (decode_shutdown_timed_out && close_result) {
+            error failure;
+            failure.category = error_category::stream;
+            failure.code = error_code::operation_timed_out;
+            failure.operation = "playback_session::close";
+            failure.message =
+                "The playback session was closed, but decoder cleanup was deferred because "
+                "a synchronous Media Foundation operation did not finish before the configured timeout.";
+            failure.recoverable = true;
+            return result<void>::failure(std::move(failure));
         }
         return close_result;
     }
@@ -1246,8 +1267,8 @@ private:
             if (needs_open) {
                 {
                     std::scoped_lock lock(mutex_);
-                    if (shutting_down_ || generation != requested_source_generation_ ||
-                        seek_sequence != requested_seek_sequence_) {
+                    if (!decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
                         continue;
                     }
                 }
@@ -1255,7 +1276,12 @@ private:
                 auto open_result = decoder_->open(source_uri, format, decoder_epoch);
                 if (!open_result) {
                     std::scoped_lock lock(mutex_);
-                    if (!shutting_down_ && generation == requested_source_generation_) {
+                    if (!decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
+                        active_generation = 0;
+                        continue;
+                    }
+                    if (!shutting_down_) {
                         handle_source_error_locked(open_result.error());
                     }
                     active_generation = generation;
@@ -1267,6 +1293,14 @@ private:
                     failed_frame_count = frame_count;
                     continue;
                 }
+                {
+                    std::scoped_lock lock(mutex_);
+                    if (!decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
+                        active_generation = 0;
+                        continue;
+                    }
+                }
                 if (format.channel_count == 0U || frame_count >
                         (std::numeric_limits<std::size_t>::max)() /
                             static_cast<std::size_t>(format.channel_count)) {
@@ -1275,7 +1309,11 @@ private:
                 const std::size_t samples_per_slot = static_cast<std::size_t>(frame_count) *
                     static_cast<std::size_t>(format.channel_count);
                 pipeline = prepare_pipeline_slot(samples_per_slot, format, frame_count);
-                publish_decoded_pipeline(pipeline);
+                if (!publish_decoded_pipeline_if_current(
+                        pipeline, generation, seek_sequence, decoder_epoch)) {
+                    active_generation = 0;
+                    continue;
+                }
                 active_generation = generation;
                 active_format = format;
                 active_frame_count = frame_count;
@@ -1284,7 +1322,8 @@ private:
                 request_failed = false;
                 {
                     std::scoped_lock lock(mutex_);
-                    if (generation == requested_source_generation_) {
+                    if (decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
                         decoder_ready_ = true;
                         state_.duration_ms = decoder_->duration_ms();
                     }
@@ -1296,8 +1335,12 @@ private:
                     seek_position.value_or(0), decoder_epoch);
                 if (!seek_result) {
                     std::scoped_lock lock(mutex_);
-                    if (!shutting_down_ && generation == requested_source_generation_ &&
-                        seek_sequence == requested_seek_sequence_) {
+                    if (!decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
+                        active_generation = 0;
+                        continue;
+                    }
+                    if (!shutting_down_) {
                         handle_source_error_locked(seek_result.error());
                     }
                     request_failed = true;
@@ -1307,15 +1350,28 @@ private:
                     failed_frame_count = frame_count;
                     continue;
                 }
+                {
+                    std::scoped_lock lock(mutex_);
+                    if (!decode_command_is_current_locked(
+                            generation, seek_sequence, decoder_epoch)) {
+                        active_generation = 0;
+                        continue;
+                    }
+                }
                 const std::size_t samples_per_slot = static_cast<std::size_t>(frame_count) *
                     static_cast<std::size_t>(format.channel_count);
                 pipeline = prepare_pipeline_slot(samples_per_slot, format, frame_count);
-                publish_decoded_pipeline(pipeline);
+                if (!publish_decoded_pipeline_if_current(
+                        pipeline, generation, seek_sequence, decoder_epoch)) {
+                    active_generation = 0;
+                    continue;
+                }
                 active_seek_sequence = seek_sequence;
                 end_of_stream = false;
                 request_failed = false;
                 std::scoped_lock lock(mutex_);
-                if (generation == requested_source_generation_ && seek_sequence == requested_seek_sequence_) {
+                if (decode_command_is_current_locked(
+                        generation, seek_sequence, decoder_epoch)) {
                     pending_seek_ms_.reset();
                 }
             }
@@ -1326,8 +1382,8 @@ private:
                 if (shutting_down_) {
                     return;
                 }
-                if (generation != requested_source_generation_ ||
-                    seek_sequence != requested_seek_sequence_) {
+                if (!decode_command_is_current_locked(
+                        generation, seek_sequence, decoder_epoch)) {
                     active_generation = 0;
                     continue;
                 }
@@ -1341,15 +1397,6 @@ private:
                 continue;
             }
 
-            {
-                std::scoped_lock lock(mutex_);
-                if (generation != requested_source_generation_ ||
-                    seek_sequence != requested_seek_sequence_) {
-                    active_generation = 0;
-                    continue;
-                }
-            }
-
             auto block = std::move(decoded_result.value());
             const detail::playback::decoded_metadata metadata{
                 .generation = generation,
@@ -1358,27 +1405,38 @@ private:
                 .duration_ms = block.duration_ms,
                 .end_of_stream = block.end_of_stream,
             };
-            if (pipeline->payload->queue.try_push(block.samples, metadata)) {
-                end_of_stream = block.end_of_stream;
+            {
+                std::scoped_lock lock(mutex_);
+                if (!decode_command_is_current_locked(
+                        generation, seek_sequence, decoder_epoch)) {
+                    active_generation = 0;
+                    continue;
+                }
+                if (pipeline->payload->queue.try_push(block.samples, metadata)) {
+                    end_of_stream = block.end_of_stream;
+                }
             }
         }
     }
 
     void decode_worker_entry() noexcept {
+        bool can_decode = true;
 #if defined(_WIN32)
         detail::win::com_scope com;
         auto com_result = com.initialize_multithreaded();
         if (!com_result) {
             publish_decode_worker_exception(com_result.error().message);
-            return;
+            can_decode = false;
         }
 #endif
-        try {
-            decode_loop();
-        } catch (const std::exception& exception) {
-            publish_decode_worker_exception(exception.what());
-        } catch (...) {
-            publish_decode_worker_exception("Unknown decode worker failure.");
+        if (can_decode) {
+            try {
+                decode_loop();
+            } catch (const std::exception& exception) {
+                publish_decode_worker_exception(exception.what());
+            } catch (...) {
+                publish_decode_worker_exception("Unknown decode worker failure.");
+            }
         }
         // Release Media Foundation objects on the same COM-initialized worker
         // before its apartment is uninitialized. External close after join is
@@ -1386,6 +1444,21 @@ private:
         if (decoder_) {
             decoder_->close();
         }
+        {
+            std::scoped_lock lock(mutex_);
+            decode_worker_finished_ = true;
+        }
+        decode_worker_finished_condition_.notify_all();
+    }
+
+    [[nodiscard]] bool decode_command_is_current_locked(
+        const std::uint64_t generation,
+        const std::uint64_t seek_sequence,
+        const std::uint64_t decoder_epoch) const noexcept {
+        return !shutting_down_ &&
+            generation == requested_source_generation_ &&
+            seek_sequence == requested_seek_sequence_ &&
+            decoder_epoch == requested_decoder_epoch_;
     }
 
     void publish_decode_worker_exception(const std::string& message) noexcept {
@@ -1423,14 +1496,22 @@ private:
         return nullptr;
     }
 
-    void publish_decoded_pipeline(decoded_pipeline* pipeline) {
+    [[nodiscard]] bool publish_decoded_pipeline_if_current(
+        decoded_pipeline* pipeline,
+        const std::uint64_t generation,
+        const std::uint64_t seek_sequence,
+        const std::uint64_t decoder_epoch) {
         if (!pipeline) {
             throw std::runtime_error("No free decoded pipeline slot is available.");
         }
-        decoded_pipeline_.store(pipeline, std::memory_order_seq_cst);
         std::scoped_lock lock(mutex_);
+        if (!decode_command_is_current_locked(generation, seek_sequence, decoder_epoch)) {
+            return false;
+        }
+        decoded_pipeline_.store(pipeline, std::memory_order_seq_cst);
         last_known_sample_rate_ = static_cast<float>(pipeline->payload->format.sample_rate);
         recompute_equalizer_metadata_locked(last_known_sample_rate_);
+        return true;
     }
 
     void refresh_active_output_device_state(const device_selector& selector) {
@@ -1573,6 +1654,7 @@ private:
     std::mutex decoder_command_mutex_;
     std::condition_variable recovery_condition_;
     std::condition_variable decode_condition_;
+    std::condition_variable decode_worker_finished_condition_;
     std::thread recovery_thread_;
     std::thread decode_thread_;
     playback_state state_{};
@@ -1588,6 +1670,7 @@ private:
     bool shutting_down_ = false;
     bool closed_ = false;
     bool reached_end_of_stream_ = false;
+    bool decode_worker_finished_ = false;
     std::uint64_t requested_source_generation_ = 0;
     std::atomic<std::uint64_t> requested_generation_atomic_{0};
     std::uint64_t requested_seek_sequence_ = 0;

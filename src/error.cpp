@@ -49,6 +49,8 @@ std::string_view to_string(const error_code code) noexcept {
         return "stream_stop_failed";
     case error_code::callback_failed:
         return "callback_failed";
+    case error_code::operation_timed_out:
+        return "operation_timed_out";
     case error_code::platform_failure:
         return "platform_failure";
     case error_code::not_implemented:

@@ -1,5 +1,6 @@
 #include "internal/playback/playback_decoder.h"
 
+#include <atomic>
 #include <mutex>
 #include <utility>
 
@@ -64,11 +65,13 @@ public:
     result<decoded_block> read_frames(std::uint32_t, std::uint64_t epoch) override {
         return result<decoded_block>::failure(open({}, {}, epoch).error());
     }
-    std::uint64_t request_cancel() noexcept override { return ++epoch_; }
+    std::uint64_t request_cancel() noexcept override {
+        return epoch_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+    }
     void close() noexcept override {}
     std::int64_t duration_ms() const noexcept override { return 0; }
 private:
-    std::uint64_t epoch_ = 0;
+    std::atomic<std::uint64_t> epoch_{0};
 };
 #endif
 

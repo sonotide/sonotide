@@ -31,6 +31,11 @@ struct playback_session_config {
     int initial_volume_percent = 100;
     /// Необязательный начальный снимок эквалайзера.
     std::optional<equalizer_state> initial_equalizer_state;
+    /// Максимальное время ожидания decode worker при close().
+    /// Допустимый диапазон: 1..5000 ms. Если синхронный
+    /// Media Foundation handler не вернулся вовремя, сессия логически закрывается,
+    /// а его изолированный COM-контекст освободится на worker-потоке после возврата handler.
+    std::uint32_t decoder_shutdown_timeout_ms = 1500;
 };
 
     /// Высокоуровневая сессия воспроизведения, объединяющая транспорт, декодирование и EQ.
@@ -101,9 +106,10 @@ public:
     /// Возвращает допустимый диапазон частот для конкретной полосы текущего EQ-layout.
     [[nodiscard]] std::optional<equalizer_frequency_range> equalizer_band_frequency_range(
         std::size_t band_index) const;
-    /// Закрывает сессию и освобождает runtime resources.
-    /// Вызов синхронный и может ждать уже начатую операцию Media Foundation
-    /// или файловой системы для текущего источника.
+    /// Логически закрывает сессию и освобождает render resources.
+    /// Ожидание decode worker ограничено decoder_shutdown_timeout_ms;
+    /// при timeout возвращается recoverable operation_timed_out, а изолированные
+    /// implementation/COM resources могут удерживаться до возврата OS handler.
     result<void> close();
 
 private:

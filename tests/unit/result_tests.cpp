@@ -26,6 +26,13 @@ int main() {
     // Специализация void должна вести себя так же предсказуемо, как и типизированный result.
     auto ok_void = sonotide::result<void>::success();
     REQUIRE(ok_void.has_value());
+    bool empty_error_access_threw = false;
+    try {
+        (void)ok_void.error();
+    } catch (const std::bad_optional_access&) {
+        empty_error_access_threw = true;
+    }
+    REQUIRE(empty_error_access_threw);
 
     auto bad_void = sonotide::result<void>::failure(failure);
     REQUIRE(!bad_void.has_value());
@@ -49,5 +56,7 @@ int main() {
     // Строковые представления ошибок должны быть стабильными.
     REQUIRE(sonotide::to_string(sonotide::error_category::stream) == std::string_view("stream"));
     REQUIRE(sonotide::to_string(sonotide::error_code::invalid_state) == std::string_view("invalid_state"));
+    REQUIRE(sonotide::to_string(sonotide::error_code::operation_timed_out) ==
+        std::string_view("operation_timed_out"));
     return 0;
 }

@@ -14,7 +14,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include "internal/win/com_scope.h"
 #include "internal/win/hresult_utils.h"
 #include "internal/win/media_foundation_decoder_validation.h"
 
@@ -483,45 +482,32 @@ result<decoded_audio_block> media_foundation_decoder::read_frames(
 }
 
 /// Освобождает source reader и очищает всё кешированное decode-состояние.
-void media_foundation_decoder::close() {
-    Microsoft::WRL::ComPtr<IMFSourceReader> source_reader_to_release;
-    {
-        std::scoped_lock lock(source_reader_mutex_);
-        source_reader_.Swap(source_reader_to_release);
+void media_foundation_decoder::close() noexcept {
+    try {
+        Microsoft::WRL::ComPtr<IMFSourceReader> source_reader_to_release;
+        {
+            std::scoped_lock lock(source_reader_mutex_);
+            source_reader_.Swap(source_reader_to_release);
+        }
+        source_reader_to_release.Reset();
+        decoded_samples_.clear();
+        decoded_sample_offset_ = 0;
+        next_sample_time_100ns_ = 0;
+        duration_100ns_ = 0;
+        end_of_stream_ = false;
+        output_format_ = {};
+    } catch (...) {
+        // This method is the worker-apartment cleanup boundary. Cleanup must
+        // never terminate a noexcept playback-session shutdown.
     }
-    source_reader_to_release.Reset();
-    decoded_samples_.clear();
-    decoded_sample_offset_ = 0;
-    next_sample_time_100ns_ = 0;
-    duration_100ns_ = 0;
-    end_of_stream_ = false;
-    output_format_ = {};
 }
 
 std::uint64_t media_foundation_decoder::request_cancel() noexcept {
-    const std::uint64_t next_epoch = cancellation_.request();
-    // Public session methods may request cancellation from any caller thread.
-    // Initialize COM before even taking an owning interface snapshot, because
-    // copying the ComPtr invokes IUnknown::AddRef on that thread.
-    com_scope com;
-    const auto com_result = com.initialize_multithreaded();
-    if (!com_result) {
-        return next_epoch;
-    }
-    Microsoft::WRL::ComPtr<IMFSourceReader> source_reader;
-    try {
-        std::scoped_lock lock(source_reader_mutex_);
-        source_reader = source_reader_;
-    } catch (...) {
-        // Cancellation is best-effort, but must never violate the noexcept API.
-        return next_epoch;
-    }
-    if (source_reader) {
-        // Flush is intentionally outside the mutex: the local ComPtr prevents
-        // destruction while synchronous Flush cancels a pending ReadSample.
-        (void)source_reader->Flush(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS));
-    }
-    return next_epoch;
+    // Flush itself is a synchronous Media Foundation call and is permitted to
+    // block in a third-party byte-stream handler. Public load/seek/close paths
+    // therefore perform only epoch invalidation; the worker checks this epoch
+    // before publishing any data or state.
+    return cancellation_.request();
 }
 
 /// Сообщает, активен ли сейчас source reader.
