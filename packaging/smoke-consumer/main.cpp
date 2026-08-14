@@ -1,8 +1,12 @@
-#include "sonotide/runtime.h"
+#include "sonotide/error.h"
 #include "sonotide/version.h"
 
 int main() {
-    [[maybe_unused]] constexpr auto version = sonotide::version_string;
-    [[maybe_unused]] sonotide::runtime_options options{};
-    return 0;
+    if (sonotide::version_string.empty()) {
+        return 1;
+    }
+
+    // Calling an out-of-line implementation function verifies that the imported
+    // target resolves the installed library without initializing Windows audio.
+    return sonotide::to_string(sonotide::error_category::initialization).empty() ? 1 : 0;
 }

@@ -19,12 +19,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Set up MSVC developer command prompt
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -32,7 +32,11 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $tagVersion = "${{ github.ref_name }}".TrimStart('v')
+          $tagName = "${{ github.ref_name }}"
+          if ($tagName -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw "Release tag '$tagName' must have the exact form vMAJOR.MINOR.PATCH."
+          }
+          $tagVersion = $Matches[1]
 
           $cmakeText = Get-Content CMakeLists.txt -Raw
           if ($cmakeText -notmatch 'project\(Sonotide VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
@@ -67,17 +71,6 @@ jobs:
       - name: Install release package tree
         run: cmake --install build/ci-ninja-release
 
-      - name: Configure smoke consumer against installed package
-        run: >
-          cmake -S packaging/smoke-consumer
-          -B build/smoke-consumer
-          -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/build/install/ci-ninja-release
-
-      - name: Build smoke consumer
-        run: cmake --build build/smoke-consumer
-
       - name: Package release SDK archive
         id: package
         shell: pwsh
@@ -85,6 +78,7 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $assetBaseName = "sonotide-$version-windows-msvc-x64-release"
           $packageRoot = Join-Path $PWD "build/release-package/$assetBaseName"
+          $verificationRoot = Join-Path $PWD "build/release-package-verification"
           $zipPath = Join-Path $PWD "build/$assetBaseName.zip"
           $checksumPath = Join-Path $PWD "build/$assetBaseName.zip.sha256"
 
@@ -94,6 +88,9 @@ jobs:
           if (Test-Path $zipPath) {
             Remove-Item $zipPath -Force
           }
+          if (Test-Path $verificationRoot) {
+            Remove-Item $verificationRoot -Recurse -Force
+          }
           if (Test-Path $checksumPath) {
             Remove-Item $checksumPath -Force
           }
@@ -101,17 +98,34 @@ jobs:
           New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
           Copy-Item -Path "build/install/ci-ninja-release/*" -Destination $packageRoot -Recurse
           Compress-Archive -Path $packageRoot -DestinationPath $zipPath -Force
+          Expand-Archive -Path $zipPath -DestinationPath $verificationRoot
+          Move-Item -LiteralPath "build/install/ci-ninja-release" -Destination "build/original-install-tree"
 
           $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path $checksumPath -Value "$hash  $assetBaseName.zip"
 
           "asset_name=$assetBaseName.zip" >> $env:GITHUB_OUTPUT
           "asset_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "verification_prefix=$verificationRoot/$assetBaseName" >> $env:GITHUB_OUTPUT
           "checksum_name=$assetBaseName.zip.sha256" >> $env:GITHUB_OUTPUT
           "checksum_path=$checksumPath" >> $env:GITHUB_OUTPUT
 
+      - name: Configure smoke consumer against extracted release archive
+        run: >
+          cmake -S packaging/smoke-consumer
+          -B build/smoke-consumer
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH=${{ steps.package.outputs.verification_prefix }}
+
+      - name: Build smoke consumer
+        run: cmake --build build/smoke-consumer
+
+      - name: Run smoke consumer
+        run: ctest --test-dir build/smoke-consumer --output-on-failure
+
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: Sonotide v${{ steps.version.outputs.version }}
           tag_name: ${{ github.ref_name }}

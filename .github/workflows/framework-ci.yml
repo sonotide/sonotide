@@ -33,10 +33,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up MSVC developer command prompt
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -52,9 +52,29 @@ jobs:
       - name: Install package tree
         run: cmake --install build/${{ matrix.preset }}
 
+      - name: Relocate installed package tree
+        shell: pwsh
+        run: |
+          $relocatedDir = "build/relocated-${{ matrix.preset }}"
+          Move-Item -LiteralPath "${{ matrix.install_dir }}" -Destination $relocatedDir
+
+      - name: Configure smoke consumer against relocated package
+        run: >
+          cmake -S packaging/smoke-consumer
+          -B build/smoke-consumer-${{ matrix.preset }}
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/build/relocated-${{ matrix.preset }}
+
+      - name: Build smoke consumer
+        run: cmake --build build/smoke-consumer-${{ matrix.preset }}
+
+      - name: Run smoke consumer
+        run: ctest --test-dir build/smoke-consumer-${{ matrix.preset }} --output-on-failure
+
       - name: Upload install tree artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.install_dir }}
+          path: build/relocated-${{ matrix.preset }}
           if-no-files-found: error
