@@ -18,6 +18,11 @@ struct cotaskmem_deleter {
 /// Удобный alias для владения `WAVEFORMATEX` через `std::unique_ptr`.
 using unique_wave_format = std::unique_ptr<WAVEFORMATEX, cotaskmem_deleter>;
 
+/// Проверяет арифметику и поддерживаемую PCM-раскладку нативного формата.
+[[nodiscard]] result<void> validate_wave_format(const WAVEFORMATEX& format);
+/// Строит проверенный extensible WAVE format из полного набора format hints.
+[[nodiscard]] result<unique_wave_format> make_requested_wave_format(const format_request& request);
+
 /// Результат выбора конкретного формата для shared-mode WASAPI.
 struct negotiated_format {
     /// Владение нативным `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE`.

@@ -42,7 +42,8 @@ struct render_stream_config {
     format_request format;
     /// Тайминговые предпочтения потока.
     stream_timing timing;
-    /// Пытаться восстановиться после потери устройства.
+    /// Policy hint для владельца потока: low-level stream сообщает device_lost и переходит в faulted,
+    /// а повторное открытие выполняет владелец или high-level playback_session.
     bool auto_recover_device_loss = true;
     /// Предзаполнять output buffer тишиной до старта аудио.
     bool prefill_with_silence = true;
@@ -60,7 +61,8 @@ struct capture_stream_config {
     format_request format;
     /// Тайминговые предпочтения потока.
     stream_timing timing;
-    /// Пытаться восстановиться после потери устройства.
+    /// Policy hint для владельца потока: low-level stream сообщает device_lost и переходит в faulted,
+    /// а повторное открытие выполняет владелец или high-level playback_session.
     bool auto_recover_device_loss = true;
     /// Отдавать тишину вместо ошибки при capture glitch.
     bool deliver_silence_on_glitch = false;
@@ -78,7 +80,8 @@ struct loopback_stream_config {
     format_request format;
     /// Тайминговые предпочтения потока.
     stream_timing timing;
-    /// Пытаться восстановиться после потери устройства.
+    /// Policy hint для владельца потока: low-level stream сообщает device_lost и переходит в faulted,
+    /// а повторное открытие выполняет владелец или high-level playback_session.
     bool auto_recover_device_loss = true;
 };
 

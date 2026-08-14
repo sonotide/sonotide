@@ -25,11 +25,37 @@ stream_status closed_status() {
     return status;
 }
 
+void close_noexcept(const std::shared_ptr<detail::stream_handle>& handle) noexcept {
+    if (handle) {
+        try {
+            (void)handle->close();
+        } catch (...) {
+            // Explicit close() is the diagnostic path; implicit cleanup must
+            // honor the public noexcept destructor/move contract.
+        }
+    }
+}
+
 }  // namespace
 
 // Сохраняет принадлежащий внутренней реализации дескриптор потока внутри публичной capture_stream-обёртки.
 capture_stream::capture_stream(std::shared_ptr<detail::stream_handle> handle) noexcept
     : handle_(std::move(handle)) {}
+
+capture_stream::capture_stream(capture_stream&& other) noexcept
+    : handle_(other.handle_.exchange(nullptr)) {}
+
+capture_stream::~capture_stream() noexcept {
+    close_noexcept(handle_.exchange(nullptr));
+}
+
+capture_stream& capture_stream::operator=(capture_stream&& other) noexcept {
+    if (this != &other) {
+        close_noexcept(handle_.exchange(nullptr));
+        handle_.store(other.handle_.exchange(nullptr));
+    }
+    return *this;
+}
 
 // Экспортирует приватную фабрику, чтобы runtime мог строить обёртки, не раскрывая владение handle.
 capture_stream detail::make_capture_stream(std::shared_ptr<detail::stream_handle> handle) {
@@ -38,52 +64,62 @@ capture_stream detail::make_capture_stream(std::shared_ptr<detail::stream_handle
 
 // Показывает, владеет ли обёртка ещё живым дескриптором потока во внутренней реализации.
 bool capture_stream::is_open() const noexcept {
-    return static_cast<bool>(handle_);
+    return static_cast<bool>(handle_.load());
 }
 
 // Запускает capture stream и возвращает структурированную ошибку, если обёртка отсоединена.
 result<void> capture_stream::start() {
-    if (!handle_) {
+    auto handle = handle_.load();
+    if (!handle) {
         return result<void>::failure(make_invalid_handle_error("capture_stream::start"));
     }
 
-    return handle_->start();
+    return handle->start();
 }
 
 // Останавливает поток захвата и пробрасывает ошибки завершения внутренней реализации.
 result<void> capture_stream::stop() {
-    if (!handle_) {
+    auto handle = handle_.load();
+    if (!handle) {
         return result<void>::failure(make_invalid_handle_error("capture_stream::stop"));
     }
 
-    return handle_->stop();
+    return handle->stop();
 }
 
 // Сбрасывает жизненный цикл потока обратно в prepared без пересоздания обёртки.
 result<void> capture_stream::reset() {
-    if (!handle_) {
+    auto handle = handle_.load();
+    if (!handle) {
         return result<void>::failure(make_invalid_handle_error("capture_stream::reset"));
     }
 
-    return handle_->reset();
+    return handle->reset();
 }
 
 // Закрывает handle потока и оставляет обёртку отсоединённой.
 result<void> capture_stream::close() {
-    if (!handle_) {
+    auto handle = handle_.load();
+    if (!handle) {
         return result<void>::failure(make_invalid_handle_error("capture_stream::close"));
     }
 
-    return handle_->close();
+    auto close_result = handle->close();
+    if (close_result) {
+        auto expected = handle;
+        (void)handle_.compare_exchange_strong(expected, nullptr);
+    }
+    return close_result;
 }
 
 // Возвращает текущий статус внутренней реализации или closed-снимок, если обёртка уже отсоединена.
 stream_status capture_stream::status() const {
-    if (!handle_) {
+    auto handle = handle_.load();
+    if (!handle) {
         return closed_status();
     }
 
-    return handle_->status();
+    return handle->status();
 }
 
 }  // namespace sonotide

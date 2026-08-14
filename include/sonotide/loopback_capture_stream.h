@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "sonotide/result.h"
@@ -17,12 +18,12 @@ public:
     /// Создаёт пустую не владеющую обёртку stream.
     loopback_capture_stream() = default;
     /// Освобождает stream handle при уничтожении обёртки.
-    ~loopback_capture_stream() = default;
+    ~loopback_capture_stream() noexcept;
 
     /// Перемещает владение базовым handle.
-    loopback_capture_stream(loopback_capture_stream&&) noexcept = default;
+    loopback_capture_stream(loopback_capture_stream&& other) noexcept;
     /// Перемещает владение базовым handle.
-    loopback_capture_stream& operator=(loopback_capture_stream&&) noexcept = default;
+    loopback_capture_stream& operator=(loopback_capture_stream&& other) noexcept;
 
     /// Поток loopback capture не копируется.
     loopback_capture_stream(const loopback_capture_stream&) = delete;
@@ -47,7 +48,7 @@ private:
     explicit loopback_capture_stream(std::shared_ptr<detail::stream_handle> handle) noexcept;
 
     /// Разделяемое владение backend stream handle.
-    std::shared_ptr<detail::stream_handle> handle_;
+    std::atomic<std::shared_ptr<detail::stream_handle>> handle_;
 
     /// Runtime имеет право создавать обёртки потоков.
     friend class runtime;

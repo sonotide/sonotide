@@ -7,6 +7,18 @@
 #include "internal/runtime_backend.h"
 
 namespace sonotide {
+namespace {
+
+error invalid_runtime_error(const char* operation) {
+    error failure;
+    failure.category = error_category::initialization;
+    failure.code = error_code::invalid_state;
+    failure.operation = operation;
+    failure.message = "Cannot use a runtime after its backend has been moved away.";
+    return failure;
+}
+
+}  // namespace
 
 // Привязывает публичный объект среды выполнения к конкретной внутренней реализации, которая владеет платформенными ресурсами.
 runtime::runtime(std::shared_ptr<detail::runtime_backend> backend) noexcept
@@ -25,6 +37,10 @@ result<runtime> runtime::create(runtime_options options) {
 
 // Передаёт перечисление устройств во внутреннюю реализацию и сохраняет результат в обёртке `result`.
 result<std::vector<device_info>> runtime::enumerate_devices(const device_direction direction) const {
+    if (!backend_) {
+        return result<std::vector<device_info>>::failure(
+            invalid_runtime_error("runtime::enumerate_devices"));
+    }
     return backend_->enumerate_devices(direction);
 }
 
@@ -32,6 +48,9 @@ result<std::vector<device_info>> runtime::enumerate_devices(const device_directi
 result<device_info> runtime::default_device(
     const device_direction direction,
     const device_role role) const {
+    if (!backend_) {
+        return result<device_info>::failure(invalid_runtime_error("runtime::default_device"));
+    }
     return backend_->default_device(direction, role);
 }
 
@@ -39,6 +58,10 @@ result<device_info> runtime::default_device(
 result<render_stream> runtime::open_render_stream(
     const render_stream_config& config,
     render_callback& callback) {
+    if (!backend_) {
+        return result<render_stream>::failure(
+            invalid_runtime_error("runtime::open_render_stream"));
+    }
     // Создание дескриптора остаётся во внутренней реализации, чтобы этот слой только собирал публичные объекты.
     auto handle_result = backend_->open_render_stream(config, callback);
     if (!handle_result) {
@@ -52,6 +75,10 @@ result<render_stream> runtime::open_render_stream(
 result<capture_stream> runtime::open_capture_stream(
     const capture_stream_config& config,
     capture_callback& callback) {
+    if (!backend_) {
+        return result<capture_stream>::failure(
+            invalid_runtime_error("runtime::open_capture_stream"));
+    }
     // У захвата тот же паттерн владения, что и у рендеринга: сначала дескриптор внутренней реализации, затем обёртка.
     auto handle_result = backend_->open_capture_stream(config, callback);
     if (!handle_result) {
@@ -65,6 +92,10 @@ result<capture_stream> runtime::open_capture_stream(
 result<loopback_capture_stream> runtime::open_loopback_stream(
     const loopback_stream_config& config,
     capture_callback& callback) {
+    if (!backend_) {
+        return result<loopback_capture_stream>::failure(
+            invalid_runtime_error("runtime::open_loopback_stream"));
+    }
     auto handle_result = backend_->open_loopback_stream(config, callback);
     if (!handle_result) {
         return result<loopback_capture_stream>::failure(handle_result.error());
@@ -76,6 +107,10 @@ result<loopback_capture_stream> runtime::open_loopback_stream(
 
 // Собирает высокоуровневую сессию воспроизведения поверх той же внутренней реализации и времени жизни среды выполнения.
 result<playback_session> runtime::open_playback_session(const playback_session_config& config) {
+    if (!backend_) {
+        return result<playback_session>::failure(
+            invalid_runtime_error("runtime::open_playback_session"));
+    }
     return playback_session::create(backend_, config);
 }
 

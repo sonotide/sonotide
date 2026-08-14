@@ -7,6 +7,10 @@
 namespace sonotide {
 
 /// Базовый интерфейс для render-side stream callback.
+/// Callback должен жить до успешного `close()` из потока вне callback-а. `close()` из самого
+/// callback только запрашивает остановку и возвращает ошибку; уничтожать callback или wrapper
+/// внутри callback нельзя.
+/// Backend перехватывает исключения callback-а и переводит stream в `faulted`.
 class render_callback {
 public:
     /// Виртуальный деструктор для derived callback.
@@ -21,6 +25,10 @@ public:
 };
 
 /// Базовый интерфейс для capture-side stream callback.
+/// Callback должен жить до успешного `close()` из потока вне callback-а. `close()` из самого
+/// callback только запрашивает остановку и возвращает ошибку; уничтожать callback или wrapper
+/// внутри callback нельзя.
+/// Backend перехватывает исключения callback-а и переводит stream в `faulted`.
 class capture_callback {
 public:
     /// Виртуальный деструктор для derived callback.

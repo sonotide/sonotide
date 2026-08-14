@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "sonotide/result.h"
@@ -18,12 +19,12 @@ public:
     /// Создаёт пустую не владеющую обёртку stream.
     render_stream() = default;
     /// Освобождает stream handle при уничтожении обёртки.
-    ~render_stream() = default;
+    ~render_stream() noexcept;
 
     /// Перемещает владение базовым handle.
-    render_stream(render_stream&&) noexcept = default;
+    render_stream(render_stream&& other) noexcept;
     /// Перемещает владение базовым handle.
-    render_stream& operator=(render_stream&&) noexcept = default;
+    render_stream& operator=(render_stream&& other) noexcept;
 
     /// Поток render не копируется.
     render_stream(const render_stream&) = delete;
@@ -48,7 +49,7 @@ private:
     explicit render_stream(std::shared_ptr<detail::stream_handle> handle) noexcept;
 
     /// Разделяемое владение backend stream handle.
-    std::shared_ptr<detail::stream_handle> handle_;
+    std::atomic<std::shared_ptr<detail::stream_handle>> handle_;
 
     /// Runtime имеет право создавать обёртки потоков.
     friend class runtime;
