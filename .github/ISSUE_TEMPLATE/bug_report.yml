@@ -1,0 +1,126 @@
+name: Bug report
+description: Report a reproducible problem in Sonotide
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Sonotide. Please provide enough detail for someone else to reproduce the problem.
+
+        Do not disclose security vulnerabilities here. Follow the private reporting instructions in the [security policy](https://github.com/sonotide/sonotide/security/policy).
+
+  - type: dropdown
+    id: version
+    attributes:
+      label: Sonotide version
+      description: Which version contains the problem?
+      options:
+        - 0.4.1
+        - main or another source build
+        - Another version
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Official release SDK
+        - Built from source
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Include the edition and build number when possible.
+      placeholder: Windows 11 24H2, build 26100
+    validations:
+      required: true
+
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler and version
+      placeholder: MSVC 19.51 / Visual Studio 2026
+    validations:
+      required: true
+
+  - type: input
+    id: audio-device
+    attributes:
+      label: Audio device
+      description: Include the device name, connection type, and driver when relevant.
+      placeholder: USB headset, Bluetooth headphones, built-in speakers
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Device enumeration
+        - Render stream
+        - Capture stream
+        - Loopback capture
+        - Playback session
+        - Equalizer or DSP
+        - CMake or release package
+        - Documentation or examples
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem description
+      description: Describe what went wrong and when it happens.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Create a runtime...
+        2. Open a stream...
+        3. Disconnect the device...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect Sonotide to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: minimal-code
+    attributes:
+      label: Minimal code sample
+      description: Remove application-specific code and secrets when possible.
+      render: cpp
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors and logs
+      description: Paste complete Sonotide, CMake, compiler, or test output here.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I confirmed that this report does not disclose a security vulnerability or sensitive information.
+          required: true

@@ -1,0 +1,48 @@
+name: Documentation problem
+description: Report missing, unclear, or incorrect documentation
+title: "[Docs]: "
+body:
+  - type: dropdown
+    id: location
+    attributes:
+      label: Documentation area
+      options:
+        - Documentation website
+        - README
+        - API comments
+        - Code examples
+        - Build or installation instructions
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: page
+    attributes:
+      label: Page or file
+      description: Paste the page URL or repository path.
+      placeholder: https://sonotide.mintlify.app/en/start/getting-started
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is unclear or incorrect?
+      description: Quote a short relevant fragment when that helps identify it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: correction
+    attributes:
+      label: Suggested improvement
+      description: Describe the expected explanation, behavior, or correction.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the current documentation and searched existing issues.
+          required: true

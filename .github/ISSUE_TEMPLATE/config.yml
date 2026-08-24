@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Sonotide documentation
+    url: https://sonotide.mintlify.app/en
+    about: Read the installation guide, quickstart, guides, and known limitations.
+  - name: Report a security vulnerability
+    url: https://github.com/sonotide/sonotide/security/policy
+    about: Use the private reporting instructions instead of opening a public issue.

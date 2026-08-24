@@ -1,0 +1,76 @@
+name: Feature request
+description: Propose an improvement or new capability for Sonotide
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an improvement. Explain the user problem first; a concrete use case helps evaluate the right API and scope.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Public API
+        - Device enumeration
+        - Render stream
+        - Capture or loopback
+        - Playback session
+        - Equalizer or DSP
+        - Platform support
+        - CMake or packaging
+        - Documentation or examples
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to build, and what currently prevents or complicates it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like. An exact API design is optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any workarounds or alternative designs you have tried.
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example usage
+      description: If useful, show what the desired API or workflow could look like.
+      render: cpp
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you like to help implement it?
+      options:
+        - Yes
+        - Maybe, with guidance
+        - No
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find the same request.
+          required: true
+        - label: I understand that Sonotide is in public beta and its API is still evolving.
+          required: true
